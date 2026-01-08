@@ -88,7 +88,7 @@ public class UserAutoTradingService {
         for (String market : markets) {
             try {
                 executeAutoTradingForMarket(user, market, excludedMarkets);
-                Thread.sleep(200);
+                Thread.sleep(250);
             } catch (Exception e) {
                 log.error("[{}][{}] 자동매매 실행 중 오류: {}", user.getUsername(), market, e.getMessage());
             }
