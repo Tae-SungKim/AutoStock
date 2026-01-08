@@ -194,7 +194,7 @@ public class UserAutoTradingService {
             List<TradingStrategy> userStrategies = userStrategyService.getEnabledTradingStrategies(user.getId());
 
             if (userStrategies.isEmpty()) {
-                log.debug("[{}][{}] 활성화된 전략이 없습니다.", user.getUsername(), market);
+                log.info("[{}][{}] 활성화된 전략이 없습니다.", user.getUsername(), market);
                 return;
             }
 
@@ -223,7 +223,7 @@ public class UserAutoTradingService {
                 }
             }
 
-            log.debug("[{}][{}] 전략 분석 - 매수: {}/{}, 매도: {}/{}",
+            log.info("[{}][{}] 전략 분석 - 매수: {}/{}, 매도: {}/{}",
                     user.getUsername(), market, buySignals, userStrategies.size(), sellSignals, userStrategies.size());
 
             // 과반수 이상 동의 시 매매 실행
