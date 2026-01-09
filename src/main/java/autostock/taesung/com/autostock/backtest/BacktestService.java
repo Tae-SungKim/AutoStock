@@ -7,6 +7,8 @@ import autostock.taesung.com.autostock.backtest.dto.TradeRecord;
 import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Market;
+import autostock.taesung.com.autostock.repository.CandleDataRepository;
+import autostock.taesung.com.autostock.entity.CandleData;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -21,6 +23,7 @@ import java.util.stream.Collectors;
 public class BacktestService {
 
     private final UpbitApiService upbitApiService;
+    private final CandleDataRepository candleDataRepository;
     private final List<TradingStrategy> strategies;
 
     private static final double TRADING_FEE = 0.0005;  // 업비트 수수료 0.05%
@@ -856,5 +859,66 @@ public class BacktestService {
                 .winRate(Math.round(winRate * 10.0) / 10.0)
                 .tradeHistory(tradeHistory)
                 .build();
+    }
+
+    /**
+     * DB의 캔들 데이터를 Candle DTO 리스트로 변환
+     */
+    private List<Candle> convertToCandles(List<CandleData> candleDataList) {
+        return candleDataList.stream()
+                .map(data -> Candle.builder()
+                        .market(data.getMarket())
+                        .candleDateTimeUtc(data.getCandleDateTimeUtc())
+                        .candleDateTimeKst(data.getCandleDateTimeKst())
+                        .openingPrice(data.getOpeningPrice())
+                        .highPrice(data.getHighPrice())
+                        .lowPrice(data.getLowPrice())
+                        .tradePrice(data.getTradePrice())
+                        .timestamp(data.getTimestamp())
+                        .candleAccTradePrice(data.getCandleAccTradePrice())
+                        .candleAccTradeVolume(data.getCandleAccTradeVolume())
+                        .unit(data.getUnit())
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * DB 데이터를 사용한 백테스팅 실행
+     */
+    public BacktestResult runBacktestFromDb(String market, double initialBalance, Integer unit) {
+        log.info("========== DB 데이터 기반 백테스팅 시작 ==========");
+        List<CandleData> candleDataList;
+        if (unit != null) {
+            candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
+        } else {
+            candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
+        }
+
+        if (candleDataList.isEmpty()) {
+            throw new RuntimeException("DB에 해당 마켓의 캔들 데이터가 없습니다: " + market);
+        }
+
+        List<Candle> candles = convertToCandles(candleDataList);
+        return executeBacktest(market, "Combined (DB Data)", candles, initialBalance);
+    }
+
+    /**
+     * DB 데이터를 사용한 실제 매매 시뮬레이션
+     */
+    public BacktestResult runRealTradingSimulationFromDb(String market, double initialBalance, Integer unit) {
+        log.info("========== DB 데이터 기반 실제 매매 시뮬레이션 시작 ==========");
+        List<CandleData> candleDataList;
+        if (unit != null) {
+            candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
+        } else {
+            candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
+        }
+
+        if (candleDataList.isEmpty()) {
+            throw new RuntimeException("DB에 해당 마켓의 캔들 데이터가 없습니다: " + market);
+        }
+
+        List<Candle> candles = convertToCandles(candleDataList);
+        return executeRealTradingSimulation(market, candles, initialBalance);
     }
 }

@@ -288,4 +288,32 @@ public class BacktestController {
             return ResponseEntity.ok(result);
         }
     }
+
+    /**
+     * DB 데이터를 기반으로 한 백테스팅 실행
+     */
+    @GetMapping("/run/db")
+    public ResponseEntity<BacktestResult> runBacktestFromDb(
+            @RequestParam(defaultValue = "KRW-BTC") String market,
+            @RequestParam(defaultValue = "1000000") double initialBalance,
+            @RequestParam(required = false) Integer unit) {
+
+        log.info("DB 데이터 기반 백테스팅 요청 - 마켓: {}", market);
+        BacktestResult result = backtestService.runBacktestFromDb(market, initialBalance, unit);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * DB 데이터를 기반으로 한 실제 매매 시뮬레이션
+     */
+    @GetMapping("/simulate/db")
+    public ResponseEntity<BacktestResult> runRealTradingSimulationFromDb(
+            @RequestParam(defaultValue = "KRW-BTC") String market,
+            @RequestParam(defaultValue = "1000000") double initialBalance,
+            @RequestParam(required = false) Integer unit) {
+
+        log.info("DB 데이터 기반 실제 매매 시뮬레이션 요청 - 마켓: {}", market);
+        BacktestResult result = backtestService.runRealTradingSimulationFromDb(market, initialBalance, unit);
+        return ResponseEntity.ok(result);
+    }
 }

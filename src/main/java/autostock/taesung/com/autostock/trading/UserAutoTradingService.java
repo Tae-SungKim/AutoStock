@@ -1,10 +1,14 @@
 package autostock.taesung.com.autostock.trading;
 
+import autostock.taesung.com.autostock.entity.CandleData;
+import autostock.taesung.com.autostock.entity.TickerData;
 import autostock.taesung.com.autostock.entity.TradeHistory;
 import autostock.taesung.com.autostock.entity.TradeHistory.TradeType;
 import autostock.taesung.com.autostock.entity.User;
 import autostock.taesung.com.autostock.exchange.upbit.UserUpbitApiService;
 import autostock.taesung.com.autostock.exchange.upbit.dto.*;
+import autostock.taesung.com.autostock.repository.CandleDataRepository;
+import autostock.taesung.com.autostock.repository.TickerDataRepository;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
 import autostock.taesung.com.autostock.repository.UserRepository;
 import autostock.taesung.com.autostock.service.UserStrategyService;
@@ -20,6 +24,7 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -35,6 +40,8 @@ public class UserAutoTradingService {
     private final TradeHistoryRepository tradeHistoryRepository;
     private final UserRepository userRepository;
     private final UserStrategyService userStrategyService;
+    private final CandleDataRepository candleDataRepository;
+    private final TickerDataRepository tickerDataRepository;
 
     private static final double UPBIT_FEE_RATE = 0.0005;
     private static final int PERIOD = 100;
@@ -176,7 +183,22 @@ public class UserAutoTradingService {
         //log.info("----- [{}][{}] 분석 시작 -----", user.getUsername(), market);
 
         try {
-            List<Candle> candles = upbitApiService.getMinuteCandles(market, minuteInterval, candleCount);
+            // DB에 데이터가 충분한지 확인하여 API 호출 갯수 조절
+            int fetchCount = candleCount;
+            Optional<CandleData> lastCandle = candleDataRepository.findFirstByMarketAndUnitOrderByCandleDateTimeKstDesc(market, minuteInterval);
+            if (lastCandle.isEmpty()) {
+                // 데이터가 전혀 없으면 200개 가져옴
+                fetchCount = candleCount;
+            } else {
+                // 이미 데이터가 있다면 최근 1~2개만 가져와서 업데이트해도 됨
+                // 하지만 전략 분석 로직이 List<Candle>을 200개 기대하므로,
+                // 분석용으로는 200개를 유지하되 DB 저장 로직에서 중복을 효율적으로 스킵함
+                // (만약 API 호출 자체를 줄이고 싶다면 분석 로직을 DB 기반으로 바꿔야 함)
+                fetchCount = candleCount;
+            }
+
+            // 1. 캔들 데이터 조회
+            List<Candle> candles = upbitApiService.getMinuteCandles(market, minuteInterval, fetchCount);
             /*if (candles == null || candles.size() < PERIOD) {
                 log.warn("[{}][{}] 캔들 데이터 부족", user.getUsername(), market);
                 return;
@@ -185,9 +207,15 @@ public class UserAutoTradingService {
                     .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
                     .sum();
                     */
+
+            // 캔들 데이터 DB 저장 (최신 데이터 위주로 저장, 중복 제외)
+            saveCandlesToDb(candles);
             // 최소거래량 설정. (3 동안 거래 평균액 )
             List<Ticker> tickers = upbitApiService.getTicker(market);
             double currentPrice = tickers.get(0).getTradePrice().doubleValue();
+
+            // 현재가 DB 저장
+            saveTickerToDb(tickers.get(0));
             //log.info("[{}][{}] 현재가: {}", user.getUsername(), market, String.format("%.4f", currentPrice));
 
             // 사용자가 선택한 전략만 가져오기
@@ -340,6 +368,85 @@ public class UserAutoTradingService {
             log.error("[{}][{}] 거래 내역 저장 실패: {}", user.getUsername(), market, e.getMessage());
         }
     }
+
+    /**
+     * 캔들 데이터 DB 저장 (중복 제외)
+     * 최신 데이터부터 확인하여 중복이 발견되면 중단을 고려할 수 있으나,
+     * API 응답 순서가 최신순이므로 효율적으로 처리
+     */
+    private void saveCandlesToDb(List<Candle> candles) {
+        if (candles == null || candles.isEmpty()) {
+            return;
+        }
+
+        try {
+            // 업비트 API는 최신 캔들이 리스트의 0번에 위치함
+            int savedCount = 0;
+            for (int i = 0; i < candles.size(); i++) {
+                Candle candle = candles.get(i);
+
+                // 이미 존재하는 캔들인지 확인 (시장가와 KST 시간 기준)
+                // 리스트의 0번부터 확인하므로, 이미 존재하는 데이터를 만나면 그 이후(과거 데이터)는 이미 저장되어 있을 확률이 높음
+                if (candleDataRepository.findByMarketAndCandleDateTimeKst(candle.getMarket(), candle.getCandleDateTimeKst()).isPresent()) {
+                    // 1분봉 데이터 적재 시, 연속된 데이터라면 중복 발견 시 중단하여 성능 최적화
+                    // 단, 200개를 가져오는데 그 중 중간에 비어있을 가능성이 아주 낮으므로 break 허용
+                    break;
+                }
+
+                CandleData candleData = CandleData.builder()
+                        .market(candle.getMarket())
+                        .candleDateTimeUtc(candle.getCandleDateTimeUtc())
+                        .candleDateTimeKst(candle.getCandleDateTimeKst())
+                        .openingPrice(candle.getOpeningPrice())
+                        .highPrice(candle.getHighPrice())
+                        .lowPrice(candle.getLowPrice())
+                        .tradePrice(candle.getTradePrice())
+                        .timestamp(candle.getTimestamp())
+                        .candleAccTradePrice(candle.getCandleAccTradePrice())
+                        .candleAccTradeVolume(candle.getCandleAccTradeVolume())
+                        .unit(candle.getUnit())
+                        .build();
+
+                candleDataRepository.save(candleData);
+                savedCount++;
+            }
+            if (savedCount > 0) {
+                log.info("[{}] 신규 캔들 데이터 {}건 저장 완료", candles.get(0).getMarket(), savedCount);
+            }
+        } catch (Exception e) {
+            log.error("캔들 데이터 DB 저장 중 오류: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Ticker 데이터 DB 저장
+     */
+    private void saveTickerToDb(Ticker ticker) {
+        try {
+            TickerData tickerData = TickerData.builder()
+                    .market(ticker.getMarket())
+                    .tradeDate(ticker.getTradeDate())
+                    .tradeTime(ticker.getTradeTime())
+                    .tradeDateKst(ticker.getTradeDateKst())
+                    .tradeTimeKst(ticker.getTradeTimeKst())
+                    .tradeTimestamp(ticker.getTradeTimestamp())
+                    .openingPrice(ticker.getOpeningPrice())
+                    .highPrice(ticker.getHighPrice())
+                    .lowPrice(ticker.getLowPrice())
+                    .tradePrice(ticker.getTradePrice())
+                    .prevClosingPrice(ticker.getPrevClosingPrice())
+                    .change(ticker.getChange())
+                    .changePrice(ticker.getChangePrice())
+                    .changeRate(ticker.getChangeRate())
+                    .timestamp(ticker.getTimestamp())
+                    .build();
+
+            tickerDataRepository.save(tickerData);
+        } catch (Exception e) {
+            log.error("[{}] Ticker 데이터 DB 저장 중 오류: {}", ticker.getMarket(), e.getMessage());
+        }
+    }
+
 
     /**
      * 사용자 보유 현황 조회
