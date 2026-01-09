@@ -135,7 +135,8 @@ public class BollingerBandStrategy implements TradingStrategy {
                             && risingTrend;
 
             if (!commonEntryFilter) {
-                log.info("[{}] 진입 필터 ", market);
+                log.info("[{}] 진입 필터 volumeIncreaseRate : {}, bandWidthPercent : {}, prevBandWidthPercent * 1.05 : {}, risingTrend",
+                        market, volumeIncreaseRate, bandWidthPercent, prevBandWidthPercent * 1.05, risingTrend);
                 return 0;
             }
 
