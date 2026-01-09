@@ -134,7 +134,10 @@ public class BollingerBandStrategy implements TradingStrategy {
                             && bandWidthPercent > prevBandWidthPercent * 1.05
                             && risingTrend;
 
-            if (!commonEntryFilter) return 0;
+            if (!commonEntryFilter) {
+                log.info("[{}] 진입 필터 ", market);
+                return 0;
+            }
 
             /* =====================================================
              *  3️⃣ 손절 잘 나는 패턴 차단 (2차 튜닝 핵심)
@@ -143,17 +146,29 @@ public class BollingerBandStrategy implements TradingStrategy {
             // ❌ 윗꼬리 과다
             double upperWickRatio =
                     (high - currentPrice) / (high - low + 1e-9);
-            if (upperWickRatio > 0.45) return 0;
+            if (upperWickRatio > 0.45) {
+                log.info("[{}] 윗꼬리 과다 : {} ", market, upperWickRatio);
+                return 0;
+            }
 
             // ❌ 거래량 식는 구간
-            if (currentVolume < prevVolume * 0.9) return 0;
+            if (currentVolume < prevVolume * 0.9) {
+                log.info("[{}] 거래량 식는 구간", market);
+                return 0;
+            }
 
             // ❌ 중단선 이격 과다 (추격매수 방지)
             double distanceFromMiddle = (currentPrice - middleBand) / atr;
-            if (distanceFromMiddle > 1.3) return 0;
+            if (distanceFromMiddle > 1.3) {
+                log.info("[{}] 중단선 이격 과다", market);
+                return 0;
+            }
 
             // ❌ RSI 피로 구간
-            if (rsi > 62) return 0;
+            if (rsi > 62) {
+                log.info("[{}] RSI 피로 구간 : {}", market, rsi);
+                return 0;
+            }
 
             /* =====================================================
              *  4️⃣ 진입 시그널
@@ -181,7 +196,10 @@ public class BollingerBandStrategy implements TradingStrategy {
                             + candles.get(2).getCandleAccTradePrice().doubleValue()
                             + candles.get(3).getCandleAccTradePrice().doubleValue()) / 3;
 
-            if (avgTradeAmount < minTradeAmount * 0.7) return 0;
+            if (avgTradeAmount < minTradeAmount * 0.7) {
+                log.info("[{}] 거래대금 필터 3분간 평균 금액 : {}, 시간대별 거래대금 필터", market, avgTradeAmount, minTradeAmount * 0.7);
+                return 0;
+            }
 
             /* =====================================================
              *  6️⃣ 매수
