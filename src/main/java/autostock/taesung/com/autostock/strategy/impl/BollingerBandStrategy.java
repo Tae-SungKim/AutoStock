@@ -129,15 +129,12 @@ public class BollingerBandStrategy implements TradingStrategy {
              *  2️⃣ 공통 진입 필터 (너무 강하지 않게)
              * ===================================================== */
             boolean commonEntryFilter =
-                    volumeIncreaseRate >= 100//120
-                            && bandWidthPercent >= 1.0//1.2
-                            //&& bandWidthPercent > prevBandWidthPercent * 1.05
+                    volumeIncreaseRate >= 120
+                            && bandWidthPercent >= 1.2
+                            && bandWidthPercent > prevBandWidthPercent * 1.05
                             && risingTrend;
 
-            if (!commonEntryFilter) {
-                log.info("[{}] 진입 필터", market);
-                return 0;
-            }
+            if (!commonEntryFilter) return 0;
 
             /* =====================================================
              *  3️⃣ 손절 잘 나는 패턴 차단 (2차 튜닝 핵심)
@@ -146,29 +143,17 @@ public class BollingerBandStrategy implements TradingStrategy {
             // ❌ 윗꼬리 과다
             double upperWickRatio =
                     (high - currentPrice) / (high - low + 1e-9);
-            if (upperWickRatio > 0.45) {
-                log.info("[{}] 윗꼬리 과다 {} ", market, upperWickRatio);
-                return 0;
-            }
+            if (upperWickRatio > 0.45) return 0;
 
             // ❌ 거래량 식는 구간
-            if (currentVolume < prevVolume * 0.9) {
-                log.info("[{}] 거래량 식는구간 {} ", market, currentVolume);
-                return 0;
-            }
+            if (currentVolume < prevVolume * 0.9) return 0;
 
             // ❌ 중단선 이격 과다 (추격매수 방지)
             double distanceFromMiddle = (currentPrice - middleBand) / atr;
-            if (distanceFromMiddle > 1.3) {
-                log.info("[{}] 중단선 이격 과다(추격매수 방지) {} ", market, distanceFromMiddle);
-                return 0;
-            }
+            if (distanceFromMiddle > 1.3) return 0;
 
             // ❌ RSI 피로 구간
-            if (rsi > /*62*/68) {
-                log.info("[{}] rsi 피로구간 {} ", market, rsi);
-                return 0;
-            }
+            if (rsi > 62) return 0;
 
             /* =====================================================
              *  4️⃣ 진입 시그널
@@ -178,7 +163,7 @@ public class BollingerBandStrategy implements TradingStrategy {
             boolean stochEntry =
                     stochK > stochD
                             && stochK > 0.15
-                            && stochK < 0.8//0.6
+                            && stochK < 0.6
                             && rsi > 45
                             && currentPrice > middleBand;
 
@@ -209,7 +194,6 @@ public class BollingerBandStrategy implements TradingStrategy {
 
             this.targetPrice = null;
             return 0;
-
 
         } catch (Exception e) {
             log.error("[전략 오류] {}", e.getMessage());
@@ -279,21 +263,12 @@ public class BollingerBandStrategy implements TradingStrategy {
         return current > prev;
     }
 
-    private double getMinTradeAmountByTime_old() {
+    private double getMinTradeAmountByTime() {
         int hour = LocalTime.now().getHour();
         if (hour >= 2 && hour < 9) return 50_000_000;
         if (hour >= 9 && hour < 18) return 120_000_000;
         if (hour >= 18 && hour < 22) return 180_000_000;
         return 220_000_000;
-    }
-
-    private double getMinTradeAmountByTime() {
-        int hour = LocalTime.now().getHour();
-        // 전체적으로 기준값을 낮춤 (예: 1.2억 -> 6천만, 2.2억 -> 1억)
-        if (hour >= 2 && hour < 9) return 30_000_000;
-        if (hour >= 9 && hour < 18) return 60_000_000;
-        if (hour >= 18 && hour < 22) return 80_000_000;
-        return 100_000_000;
     }
 
     @Override
