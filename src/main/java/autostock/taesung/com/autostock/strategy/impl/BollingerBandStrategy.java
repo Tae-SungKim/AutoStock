@@ -152,20 +152,20 @@ public class BollingerBandStrategy implements TradingStrategy {
             }
 
             // ❌ 거래량 식는 구간
-            if (currentVolume < prevVolume * 0.5) {
+            if (currentVolume < prevVolume * 0.9) {
                 log.info("[{}] 거래량 식는구간 {} ", market, currentVolume);
                 return 0;
             }
 
             // ❌ 중단선 이격 과다 (추격매수 방지)
             double distanceFromMiddle = (currentPrice - middleBand) / atr;
-            if (distanceFromMiddle > 2.5) {
+            if (distanceFromMiddle > 1.3) {
                 log.info("[{}] 중단선 이격 과다(추격매수 방지) {} ", market, distanceFromMiddle);
                 return 0;
             }
 
             // ❌ RSI 피로 구간
-            if (rsi > /*62*/80) {
+            if (rsi > /*62*/68) {
                 log.info("[{}] rsi 피로구간 {} ", market, rsi);
                 return 0;
             }
@@ -178,41 +178,25 @@ public class BollingerBandStrategy implements TradingStrategy {
             boolean stochEntry =
                     stochK > stochD
                             && stochK > 0.15
-                            //&& stochK < 0.8//0.6
+                            && stochK < 0.8//0.6
                             && rsi > 45
                             && currentPrice > middleBand;
 
             // RSI 보조
             boolean rsiEntry =
-                    rsi >= 50 //&& rsi <= 65
+                    rsi >= 50 && rsi <= 65
                             && currentPrice > middleBand;
 
             /* =====================================================
              *  5️⃣ 거래대금 필터
              * ===================================================== */
             double minTradeAmount = getMinTradeAmountByTime();
-
-            // [수정] candles.get(1~3) 대신 0번(현재)을 포함하거나 0번 위주로 변경
-            // 초단타는 '지금' 돈이 들어오는지가 훨씬 중요합니다.
-            double currentCandleAmount = candles.get(0).getCandleAccTradePrice().doubleValue();
-
-            // 과거 평균보다 '현재' 터지고 있는 거래대금이 기준치(minTradeAmount)를 넘었는지 확인
-            if (currentCandleAmount < minTradeAmount) {
-                log.info("[{}] 거래대금 필터 {} ", market, currentCandleAmount);
-                return 0;
-            }
-
-
-            /*double minTradeAmount = getMinTradeAmountByTime();
             double avgTradeAmount =
                     (candles.get(1).getCandleAccTradePrice().doubleValue()
                             + candles.get(2).getCandleAccTradePrice().doubleValue()
                             + candles.get(3).getCandleAccTradePrice().doubleValue()) / 3;
 
-            if (avgTradeAmount < minTradeAmount * 0.7) {
-                log.info("[{}] 거래대금 필터 {} ", market, avgTradeAmount);
-                return 0;
-            }*/
+            if (avgTradeAmount < minTradeAmount * 0.7) return 0;
 
             /* =====================================================
              *  6️⃣ 매수
@@ -225,6 +209,7 @@ public class BollingerBandStrategy implements TradingStrategy {
 
             this.targetPrice = null;
             return 0;
+
 
         } catch (Exception e) {
             log.error("[전략 오류] {}", e.getMessage());
@@ -304,11 +289,11 @@ public class BollingerBandStrategy implements TradingStrategy {
 
     private double getMinTradeAmountByTime() {
         int hour = LocalTime.now().getHour();
-        // 분봉 기준이므로 단위를 확 낮춥니다. (현재 코드는 3천만~1억 원 사이)
-        if (hour >= 2 && hour < 9) return 10_000_000;   // 1천만
-        if (hour >= 9 && hour < 18) return 30_000_000;  // 3천만
-        if (hour >= 18 && hour < 22) return 40_000_000; // 4천만
-        return 50_000_000; // 심야
+        // 전체적으로 기준값을 낮춤 (예: 1.2억 -> 6천만, 2.2억 -> 1억)
+        if (hour >= 2 && hour < 9) return 30_000_000;
+        if (hour >= 9 && hour < 18) return 60_000_000;
+        if (hour >= 18 && hour < 22) return 80_000_000;
+        return 100_000_000;
     }
 
     @Override
