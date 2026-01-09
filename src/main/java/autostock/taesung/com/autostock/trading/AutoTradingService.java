@@ -2,6 +2,7 @@ package autostock.taesung.com.autostock.trading;
 
 import autostock.taesung.com.autostock.entity.TradeHistory;
 import autostock.taesung.com.autostock.entity.TradeHistory.TradeType;
+import autostock.taesung.com.autostock.entity.User;
 import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Account;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
@@ -148,7 +149,7 @@ public class AutoTradingService {
     /**
      * 자동매매 실행 (멀티 마켓 지원)
      */
-    public void executeAutoTrading() {
+    public void executeAutoTrading(User user) {
         List<String> markets = getActiveMarkets();
 
         if (markets.isEmpty()) {
@@ -164,13 +165,13 @@ public class AutoTradingService {
 
         // 1. 먼저 보유 코인 손절 체크
         if (stopLossEnabled) {
-            checkAndExecuteStopLoss();
+            checkAndExecuteStopLoss(user);
         }
 
         // 2. 마켓별 전략 분석 및 매매
         for (String market : markets) {
             try {
-                executeAutoTradingForMarket(market);
+                executeAutoTradingForMarket(user, market);
                 Thread.sleep(200);  // API 속도 제한 방지
             } catch (Exception e) {
                 log.error("[{}] 자동매매 실행 중 오류: {}", market, e.getMessage());
@@ -183,11 +184,11 @@ public class AutoTradingService {
     /**
      * 보유 코인 손절 체크 및 실행
      */
-    private void checkAndExecuteStopLoss() {
+    private void checkAndExecuteStopLoss(User user) {
         log.info("----- 손절 체크 시작 -----");
 
         try {
-            List<Account> accounts = upbitApiService.getAccounts();
+            List<Account> accounts = upbitApiService.getAccounts(user);
 
             for (Account account : accounts) {
                 // KRW는 스킵
@@ -235,7 +236,7 @@ public class AutoTradingService {
                                 String.format("%.2f", profitRate * 100),
                                 String.format("%.1f", stopLossRate * 100));
 
-                        executeStopLoss(market, currentPrice, balance, profitRate);
+                        executeStopLoss(user, market, currentPrice, balance, profitRate);
                     }
 
                     Thread.sleep(200);  // API 속도 제한 방지
@@ -255,13 +256,13 @@ public class AutoTradingService {
     /**
      * 손절 매도 실행
      */
-    private void executeStopLoss(String market, double currentPrice, double coinBalance, double profitRate) {
+    private void executeStopLoss(User user, String market, double currentPrice, double coinBalance, double profitRate) {
         try {
             if(currentPrice * coinBalance < 5000){
                 log.warn("5000원 미만 매도는 불가.");
                 return;
             }
-            OrderResponse order = upbitApiService.sellMarketOrder(market, coinBalance);
+            OrderResponse order = upbitApiService.sellMarketOrder(user, market, coinBalance);
             log.warn("[{}] 🔴 손절 매도 완료! UUID: {}, 수량: {}, 손익률: {}%",
                     market, order.getUuid(), coinBalance, String.format("%.2f", profitRate * 100));
 
@@ -280,7 +281,7 @@ public class AutoTradingService {
     /**
      * 단일 마켓 자동매매 실행
      */
-    private void executeAutoTradingForMarket(String market) {
+    private void executeAutoTradingForMarket(User user, String market) {
         if (!isMarketAllowed(market)) {
             log.info("[{}] 제외된 마켓입니다. 스킵.", market);
             return;
@@ -337,10 +338,10 @@ public class AutoTradingService {
             if (buySignals >= threshold) {
                 log.info("[{}] 매수 신호! 동의 전략: {}, 목표가: {}", market, buyStrategies,
                         targetPrice != null ? String.format("%.0f", targetPrice) : "없음");
-                executeBuyForMarket(market, currentPrice, String.join(", ", buyStrategies), targetPrice);
+                executeBuyForMarket(user, market, currentPrice, String.join(", ", buyStrategies), targetPrice);
             } else if (sellSignals >= threshold) {
                 log.info("[{}] 매도 신호! 동의 전략: {}", market, sellStrategies);
-                executeSellForMarket(market, currentPrice, String.join(", ", sellStrategies));
+                executeSellForMarket(user, market, currentPrice, String.join(", ", sellStrategies));
             } else {
                 log.info("[{}] 관망 - 매매 조건 미충족", market);
             }
@@ -353,14 +354,14 @@ public class AutoTradingService {
     /**
      * 매수 실행 (특정 마켓)
      */
-    private void executeBuyForMarket(String market, double currentPrice, String strategyName, Double targetPrice) {
+    private void executeBuyForMarket(User user, String market, double currentPrice, String strategyName, Double targetPrice) {
         if (!isMarketAllowed(market)) {
             log.warn("[{}] 제외된 마켓입니다. 매수 취소.", market);
             return;
         }
 
         try {
-            double krwBalance = upbitApiService.getKrwBalance();
+            double krwBalance = upbitApiService.getKrwBalance(user);
 
             // 멀티 마켓인 경우 마켓 수로 나눔
             List<String> activeMarkets = getActiveMarkets();
@@ -380,7 +381,7 @@ public class AutoTradingService {
                 orderAmount = minOrderAmount;
             }
 
-            OrderResponse order = upbitApiService.buyMarketOrder(market, orderAmount);
+            OrderResponse order = upbitApiService.buyMarketOrder(user, market, orderAmount);
             log.info("[{}] 매수 주문 완료! UUID: {}", market, order.getUuid());
 
             // 거래 내역 저장 (목표가 포함)
@@ -394,7 +395,7 @@ public class AutoTradingService {
     /**
      * 매도 실행 (특정 마켓)
      */
-    private void executeSellForMarket(String market, double currentPrice, String strategyName) {
+    private void executeSellForMarket(User user, String market, double currentPrice, String strategyName) {
         if (!isMarketAllowed(market)) {
             log.warn("[{}] 제외된 마켓입니다. 매도 취소.", market);
             return;
@@ -402,7 +403,7 @@ public class AutoTradingService {
 
         try {
             String currency = market.split("-")[1]; // KRW-BTC -> BTC
-            double coinBalance = upbitApiService.getCoinBalance(currency);
+            double coinBalance = upbitApiService.getCoinBalance(user, currency);
 
             log.info("[{}] {} 보유량: {}", market, currency, coinBalance);
 
@@ -411,7 +412,7 @@ public class AutoTradingService {
                 return;
             }
 
-            OrderResponse order = upbitApiService.sellMarketOrder(market, coinBalance);
+            OrderResponse order = upbitApiService.sellMarketOrder(user, market, coinBalance);
             log.info("[{}] 매도 주문 완료! UUID: {}", market, order.getUuid());
 
             // 매도 금액 계산 (수량 * 현재가)
@@ -466,21 +467,21 @@ public class AutoTradingService {
     }
 
     // 하위 호환을 위한 기존 메서드 (단일 마켓)
-    private void executeBuy(double currentPrice) {
-        executeBuyForMarket(targetMarket, currentPrice, "Manual", null);
+    private void executeBuy(User user, double currentPrice) {
+        executeBuyForMarket(user, targetMarket, currentPrice, "Manual", null);
     }
 
-    private void executeSell() {
-        executeSellForMarket(targetMarket, 0, "Manual");
+    private void executeSell(User user) {
+        executeSellForMarket(user, targetMarket, 0, "Manual");
     }
 
     /**
      * 현재 보유 현황 조회
      */
-    public void printAccountStatus() {
+    public void printAccountStatus(User user) {
         log.info("========== 보유 현황 ==========");
         try {
-            List<Account> accounts = upbitApiService.getAccounts();
+            List<Account> accounts = upbitApiService.getAccounts(user);
             for (Account account : accounts) {
                 if (Double.parseDouble(account.getBalance()) > 0) {
                     log.info("{}: {} (평균 매수가: {})",
@@ -498,7 +499,7 @@ public class AutoTradingService {
     /**
      * 단일 전략으로 매매 실행
      */
-    public void executeWithStrategy(TradingStrategy strategy) {
+    public void executeWithStrategy(User user, TradingStrategy strategy) {
         log.info("========== {} 전략 매매 시작 ==========", strategy.getStrategyName());
 
         try {
@@ -509,9 +510,9 @@ public class AutoTradingService {
             int signal = strategy.analyze(candles);
 
             if (signal == 1) {
-                executeBuy(currentPrice);
+                executeBuy(user, currentPrice);
             } else if (signal == -1) {
-                executeSell();
+                executeSell(user);
             } else {
                 log.info("관망");
             }

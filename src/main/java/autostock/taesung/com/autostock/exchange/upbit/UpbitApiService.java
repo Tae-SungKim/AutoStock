@@ -1,5 +1,6 @@
 package autostock.taesung.com.autostock.exchange.upbit;
 
+import autostock.taesung.com.autostock.entity.User;
 import autostock.taesung.com.autostock.exchange.upbit.dto.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
@@ -25,10 +26,7 @@ public class UpbitApiService {
 
     private static final String API_URL = "https://api.upbit.com/v1";
 
-    @Value("${upbit.access-key:}")
     private String accessKey;
-
-    @Value("${upbit.secret-key:}")
     private String secretKey;
 
     private final RestTemplate restTemplate;
@@ -50,7 +48,7 @@ public class UpbitApiService {
     /**
      * JWT 토큰 생성 (파라미터 없음)
      */
-    private String generateToken() {
+    private String generateToken(String accessKey, String secretKey) {
         SecretKey key = Keys.hmacShaKeyFor(secretKey.getBytes(StandardCharsets.UTF_8));
         return Jwts.builder()
                 .claim("access_key", accessKey)
@@ -62,7 +60,7 @@ public class UpbitApiService {
     /**
      * JWT 토큰 생성 (파라미터 있음)
      */
-    private String generateToken(Map<String, String> params) {
+    private String generateToken(String accessKey, String secretKey, Map<String, String> params) {
         try {
             StringBuilder queryString = new StringBuilder();
             for (Map.Entry<String, String> entry : params.entrySet()) {
@@ -90,16 +88,17 @@ public class UpbitApiService {
     /**
      * 인증 헤더 생성
      */
-    private HttpHeaders createAuthHeaders() {
+    private HttpHeaders createAuthHeaders(User user) {
         HttpHeaders headers = new HttpHeaders();
-        headers.set("Authorization", "Bearer " + generateToken());
+        headers.set("Authorization", "Bearer " + generateToken(user.getUpbitAccessKey(), user.getUpbitSecretKey()));
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
     }
 
-    private HttpHeaders createAuthHeaders(Map<String, String> params) {
+    private HttpHeaders createAuthHeaders(User user,
+                                          Map<String, String> params) {
         HttpHeaders headers = new HttpHeaders();
-        headers.set("Authorization", "Bearer " + generateToken(params));
+        headers.set("Authorization", "Bearer " + generateToken(user.getUpbitAccessKey(), user.getUpbitSecretKey(), params));
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
     }
@@ -149,9 +148,9 @@ public class UpbitApiService {
     /**
      * 계좌 조회
      */
-    public List<Account> getAccounts() {
+    public List<Account> getAccounts(User user) {
         String url = API_URL + "/accounts";
-        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders());
+        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(user));
         ResponseEntity<List<Account>> response = restTemplate.exchange(
                 url,
                 HttpMethod.GET,
@@ -164,8 +163,8 @@ public class UpbitApiService {
     /**
      * KRW 잔고 조회
      */
-    public double getKrwBalance() {
-        List<Account> accounts = getAccounts();
+    public double getKrwBalance(User user) {
+        List<Account> accounts = getAccounts(user);
         return accounts.stream()
                 .filter(a -> "KRW".equals(a.getCurrency()))
                 .findFirst()
@@ -176,8 +175,8 @@ public class UpbitApiService {
     /**
      * 코인 잔고 조회
      */
-    public double getCoinBalance(String currency) {
-        List<Account> accounts = getAccounts();
+    public double getCoinBalance(User user, String currency) {
+        List<Account> accounts = getAccounts(user);
         return accounts.stream()
                 .filter(a -> currency.equals(a.getCurrency()))
                 .findFirst()
@@ -188,7 +187,7 @@ public class UpbitApiService {
     /**
      * 시장가 매수
      */
-    public OrderResponse buyMarketOrder(String market, double price) {
+    public OrderResponse buyMarketOrder(User user, String market, double price) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("market", market);
         params.put("side", "bid");
@@ -196,7 +195,7 @@ public class UpbitApiService {
         params.put("price", String.valueOf((int) price));
 
         String url = API_URL + "/orders";
-        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(params));
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(user, params));
         ResponseEntity<OrderResponse> response = restTemplate.exchange(
                 url,
                 HttpMethod.POST,
@@ -209,7 +208,7 @@ public class UpbitApiService {
     /**
      * 시장가 매도
      */
-    public OrderResponse sellMarketOrder(String market, double volume) {
+    public OrderResponse sellMarketOrder(User user, String market, double volume) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("market", market);
         params.put("side", "ask");
@@ -217,7 +216,7 @@ public class UpbitApiService {
         params.put("volume", String.valueOf(volume));
 
         String url = API_URL + "/orders";
-        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(params));
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(user, params));
         ResponseEntity<OrderResponse> response = restTemplate.exchange(
                 url,
                 HttpMethod.POST,
@@ -244,7 +243,7 @@ public class UpbitApiService {
     /**
      * 지정가 매수
      */
-    public OrderResponse buyLimitOrder(String market, double volume, double price) {
+    public OrderResponse buyLimitOrder(User user, String market, double volume, double price) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("market", market);
         params.put("side", "bid");
@@ -253,7 +252,7 @@ public class UpbitApiService {
         params.put("price", String.valueOf((int) price));
 
         String url = API_URL + "/orders";
-        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(params));
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(user, params));
         ResponseEntity<OrderResponse> response = restTemplate.exchange(
                 url,
                 HttpMethod.POST,
@@ -266,7 +265,7 @@ public class UpbitApiService {
     /**
      * 지정가 매도
      */
-    public OrderResponse sellLimitOrder(String market, double volume, double price) {
+    public OrderResponse sellLimitOrder(User user, String market, double volume, double price) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("market", market);
         params.put("side", "ask");
@@ -275,7 +274,7 @@ public class UpbitApiService {
         params.put("price", String.valueOf((int) price));
 
         String url = API_URL + "/orders";
-        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(params));
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(user, params));
         ResponseEntity<OrderResponse> response = restTemplate.exchange(
                 url,
                 HttpMethod.POST,
@@ -288,12 +287,12 @@ public class UpbitApiService {
     /**
      * 주문 취소
      */
-    public OrderResponse cancelOrder(String uuid) {
+    public OrderResponse cancelOrder(User user, String uuid) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("uuid", uuid);
 
         String url = API_URL + "/order?uuid=" + uuid;
-        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(params));
+        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(user, params));
         ResponseEntity<OrderResponse> response = restTemplate.exchange(
                 url,
                 HttpMethod.DELETE,
@@ -306,12 +305,12 @@ public class UpbitApiService {
     /**
      * 주문 조회
      */
-    public OrderResponse getOrder(String uuid) {
+    public OrderResponse getOrder(User user, String uuid) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("uuid", uuid);
 
         String url = API_URL + "/order?uuid=" + uuid;
-        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(params));
+        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(user, params));
         ResponseEntity<OrderResponse> response = restTemplate.exchange(
                 url,
                 HttpMethod.GET,
@@ -327,7 +326,7 @@ public class UpbitApiService {
      * @param state 주문 상태 (done: 완료, cancel: 취소)
      * @param limit 조회 개수 (최대 100)
      */
-    public List<ClosedOrder> getClosedOrders(String market, String state, int limit) {
+    public List<ClosedOrder> getClosedOrders(User user, String market, String state, int limit) {
         Map<String, String> params = new LinkedHashMap<>();
         if (market != null && !market.isEmpty()) {
             params.put("market", market);
@@ -342,7 +341,7 @@ public class UpbitApiService {
         }
 
         String url = API_URL + "/orders/closed?" + queryString;
-        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(params));
+        HttpEntity<String> entity = new HttpEntity<>(createAuthHeaders(user, params));
         ResponseEntity<List<ClosedOrder>> response = restTemplate.exchange(
                 url,
                 HttpMethod.GET,
@@ -355,14 +354,14 @@ public class UpbitApiService {
     /**
      * 전체 체결 완료 주문 조회 (최근 500건)
      */
-    public List<ClosedOrder> getClosedOrders() {
-        return getClosedOrders(null, "done", 500);
+    public List<ClosedOrder> getClosedOrders(User user) {
+        return getClosedOrders(user, null, "done", 500);
     }
 
     /**
      * 마켓별 체결 완료 주문 조회
      */
-    public List<ClosedOrder> getClosedOrdersByMarket(String market) {
-        return getClosedOrders(market, "done", 100);
+    public List<ClosedOrder> getClosedOrdersByMarket(User user, String market) {
+        return getClosedOrders(user, market, "done", 100);
     }
 }

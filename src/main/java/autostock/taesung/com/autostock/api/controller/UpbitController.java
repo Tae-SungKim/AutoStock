@@ -2,6 +2,7 @@ package autostock.taesung.com.autostock.api.controller;
 
 import autostock.taesung.com.autostock.entity.TradeHistory;
 import autostock.taesung.com.autostock.entity.TradeHistory.TradeType;
+import autostock.taesung.com.autostock.entity.User;
 import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
 import autostock.taesung.com.autostock.exchange.upbit.dto.*;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
@@ -9,6 +10,7 @@ import autostock.taesung.com.autostock.trading.AutoTradingService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
 import org.springframework.format.annotation.DateTimeFormat;
@@ -36,8 +38,8 @@ public class UpbitController {
      * 계좌 조회
      */
     @GetMapping("/accounts")
-    public ResponseEntity<List<Account>> getAccounts() {
-        return ResponseEntity.ok(upbitApiService.getAccounts());
+    public ResponseEntity<List<Account>> getAccounts(@AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(upbitApiService.getAccounts(user));
     }
 
     /**
@@ -83,8 +85,9 @@ public class UpbitController {
     @PostMapping("/orders/buy/market")
     public ResponseEntity<OrderResponse> buyMarketOrder(
             @RequestParam String market,
-            @RequestParam double price) {
-        OrderResponse order = upbitApiService.buyMarketOrder(market, price);
+            @RequestParam double price,
+            @AuthenticationPrincipal User user) {
+        OrderResponse order = upbitApiService.buyMarketOrder(user, market, price);
 
         // 현재가 조회 후 거래 내역 저장
         try {
@@ -104,7 +107,8 @@ public class UpbitController {
     @PostMapping("/orders/sell/market")
     public ResponseEntity<OrderResponse> sellMarketOrder(
             @RequestParam String market,
-            @RequestParam double volume) {
+            @RequestParam double volume,
+            @AuthenticationPrincipal User user) {
         // 현재가 먼저 조회
         double currentPrice = 0;
         try {
@@ -114,7 +118,7 @@ public class UpbitController {
             log.error("[{}] 현재가 조회 실패: {}", market, e.getMessage());
         }
 
-        OrderResponse order = upbitApiService.sellMarketOrder(market, volume);
+        OrderResponse order = upbitApiService.sellMarketOrder(user, market, volume);
 
         // 거래 내역 저장
         if (currentPrice > 0) {
@@ -132,8 +136,9 @@ public class UpbitController {
     public ResponseEntity<OrderResponse> buyLimitOrder(
             @RequestParam String market,
             @RequestParam double volume,
-            @RequestParam double price) {
-        OrderResponse order = upbitApiService.buyLimitOrder(market, volume, price);
+            @RequestParam double price,
+            @AuthenticationPrincipal User user) {
+        OrderResponse order = upbitApiService.buyLimitOrder(user, market, volume, price);
 
         // 거래 내역 저장 (지정가는 주문가격 사용)
         double orderAmount = volume * price;
@@ -149,8 +154,9 @@ public class UpbitController {
     public ResponseEntity<OrderResponse> sellLimitOrder(
             @RequestParam String market,
             @RequestParam double volume,
-            @RequestParam double price) {
-        OrderResponse order = upbitApiService.sellLimitOrder(market, volume, price);
+            @RequestParam double price,
+            @AuthenticationPrincipal User user) {
+        OrderResponse order = upbitApiService.sellLimitOrder(user, market, volume, price);
 
         // 거래 내역 저장 (지정가는 주문가격 사용)
         double sellAmount = volume * price;
@@ -163,24 +169,24 @@ public class UpbitController {
      * 주문 취소
      */
     @DeleteMapping("/orders/{uuid}")
-    public ResponseEntity<OrderResponse> cancelOrder(@PathVariable String uuid) {
-        return ResponseEntity.ok(upbitApiService.cancelOrder(uuid));
+    public ResponseEntity<OrderResponse> cancelOrder(@PathVariable String uuid, @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(upbitApiService.cancelOrder(user, uuid));
     }
 
     /**
      * 주문 조회
      */
     @GetMapping("/orders/{uuid}")
-    public ResponseEntity<OrderResponse> getOrder(@PathVariable String uuid) {
-        return ResponseEntity.ok(upbitApiService.getOrder(uuid));
+    public ResponseEntity<OrderResponse> getOrder(@PathVariable String uuid, @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(upbitApiService.getOrder(user, uuid));
     }
 
     /**
      * 자동매매 수동 실행
      */
     @PostMapping("/trading/execute")
-    public ResponseEntity<Map<String, String>> executeAutoTrading() {
-        autoTradingService.executeAutoTrading();
+    public ResponseEntity<Map<String, String>> executeAutoTrading(@AuthenticationPrincipal User user) {
+        autoTradingService.executeAutoTrading(user);
         Map<String, String> response = new HashMap<>();
         response.put("status", "executed");
         response.put("message", "자동매매가 실행되었습니다. 로그를 확인해주세요.");
@@ -191,8 +197,8 @@ public class UpbitController {
      * 보유 현황 조회
      */
     @GetMapping("/trading/status")
-    public ResponseEntity<Map<String, Object>> getTradingStatus() {
-        List<Account> accounts = upbitApiService.getAccounts();
+    public ResponseEntity<Map<String, Object>> getTradingStatus(@AuthenticationPrincipal User user) {
+        List<Account> accounts = upbitApiService.getAccounts(user);
         Map<String, Object> response = new HashMap<>();
         response.put("accounts", accounts);
         return ResponseEntity.ok(response);
@@ -238,12 +244,13 @@ public class UpbitController {
     @GetMapping("/orders/closed")
     public ResponseEntity<List<ClosedOrder>> getClosedOrders(
             @RequestParam(required = false) String market,
-            @RequestParam(defaultValue = "100") int limit) {
+            @RequestParam(defaultValue = "100") int limit,
+            @AuthenticationPrincipal User user) {
         List<ClosedOrder> orders;
         if (market != null && !market.isEmpty()) {
-            orders = upbitApiService.getClosedOrdersByMarket(market.toUpperCase());
+            orders = upbitApiService.getClosedOrdersByMarket(user, market.toUpperCase());
         } else {
-            orders = upbitApiService.getClosedOrders();
+            orders = upbitApiService.getClosedOrders(user);
         }
         return ResponseEntity.ok(orders);
     }
@@ -254,12 +261,13 @@ public class UpbitController {
      */
     @GetMapping("/profit/real")
     public ResponseEntity<Map<String, Object>> getRealProfit(
-            @RequestParam(required = false) String market) {
+            @RequestParam(required = false) String market,
+            @AuthenticationPrincipal User user) {
         List<ClosedOrder> orders;
         if (market != null && !market.isEmpty()) {
-            orders = upbitApiService.getClosedOrdersByMarket(market.toUpperCase());
+            orders = upbitApiService.getClosedOrdersByMarket(user, market.toUpperCase());
         } else {
-            orders = upbitApiService.getClosedOrders();
+            orders = upbitApiService.getClosedOrders(user);
         }
 
         return ResponseEntity.ok(calculateRealProfit(orders));
@@ -270,12 +278,13 @@ public class UpbitController {
      */
     @GetMapping("/profit/real/daily")
     public ResponseEntity<List<Map<String, Object>>> getRealDailyProfit(
-            @RequestParam(required = false) String market) {
+            @RequestParam(required = false) String market,
+            @AuthenticationPrincipal User user) {
         List<ClosedOrder> orders;
         if (market != null && !market.isEmpty()) {
-            orders = upbitApiService.getClosedOrdersByMarket(market.toUpperCase());
+            orders = upbitApiService.getClosedOrdersByMarket(user, market.toUpperCase());
         } else {
-            orders = upbitApiService.getClosedOrders();
+            orders = upbitApiService.getClosedOrders(user);
         }
 
         return ResponseEntity.ok(calculateRealDailyProfit(orders));
@@ -291,12 +300,13 @@ public class UpbitController {
     public ResponseEntity<Map<String, Object>> getRealTotalProfit(
             @RequestParam(required = false) String market,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
-            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @AuthenticationPrincipal User user) {
         List<ClosedOrder> orders;
         if (market != null && !market.isEmpty()) {
-            orders = upbitApiService.getClosedOrdersByMarket(market.toUpperCase());
+            orders = upbitApiService.getClosedOrdersByMarket(user, market.toUpperCase());
         } else {
-            orders = upbitApiService.getClosedOrders();
+            orders = upbitApiService.getClosedOrders(user);
         }
 
         // 날짜 필터링
