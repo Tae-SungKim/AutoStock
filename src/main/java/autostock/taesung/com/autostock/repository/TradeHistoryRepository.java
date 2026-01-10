@@ -74,7 +74,12 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
     // ========== 사용자별 조회 메서드 ==========
 
     /**
-     * 사용자별 전체 거래 내역 조회
+     * 사용자별 전체 거래 내역 조회 (정렬 없음)
+     */
+    List<TradeHistory> findByUserId(Long userId);
+
+    /**
+     * 사용자별 전체 거래 내역 조회 (최신순)
      */
     List<TradeHistory> findByUserIdOrderByCreatedAtDesc(Long userId);
 
