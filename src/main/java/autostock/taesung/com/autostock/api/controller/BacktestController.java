@@ -316,4 +316,51 @@ public class BacktestController {
         BacktestResult result = backtestService.runRealTradingSimulationFromDb(market, initialBalance, unit);
         return ResponseEntity.ok(result);
     }
+
+    /**
+     * DB 데이터를 기반으로 한 단일 전략 백테스팅
+     *
+     * @param strategy 전략 이름 (예: BollingerBandStrategy)
+     */
+    @GetMapping("/run/db/{strategy}")
+    public ResponseEntity<BacktestResult> runBacktestWithStrategyFromDb(
+            @PathVariable String strategy,
+            @RequestParam(defaultValue = "KRW-BTC") String market,
+            @RequestParam(defaultValue = "1000000") double initialBalance,
+            @RequestParam(required = false) Integer unit) {
+
+        log.info("DB 데이터 기반 {} 전략 백테스팅 요청 - 마켓: {}", strategy, market);
+        BacktestResult result = backtestService.runBacktestWithStrategyFromDb(market, strategy, initialBalance, unit);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * DB 데이터를 기반으로 한 멀티 코인 백테스팅
+     *
+     * @param markets 마켓 코드 (쉼표로 구분)
+     * @param strategy 전략 이름 (선택)
+     */
+    @GetMapping("/multi/db")
+    public ResponseEntity<MultiCoinBacktestResult> runMultiCoinBacktestFromDb(
+            @RequestParam(defaultValue = "KRW-BTC,KRW-ETH,KRW-XRP") String markets,
+            @RequestParam(required = false) String strategy,
+            @RequestParam(defaultValue = "1000000") double initialBalancePerMarket,
+            @RequestParam(required = false) Integer unit) {
+
+        List<String> marketList = Arrays.asList(markets.split(","));
+        log.info("DB 데이터 기반 멀티 코인 백테스팅 요청 - {}개 마켓, 전략: {}", marketList.size(), strategy);
+
+        MultiCoinBacktestResult result = backtestService.runMultiCoinBacktestFromDb(
+                marketList, strategy, initialBalancePerMarket, unit);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * DB에 저장된 마켓 목록 조회
+     */
+    @GetMapping("/markets/db")
+    public ResponseEntity<List<String>> getAvailableMarketsFromDb() {
+        List<String> markets = backtestService.getAvailableMarketsFromDb();
+        return ResponseEntity.ok(markets);
+    }
 }

@@ -126,17 +126,19 @@ public class BollingerBandStrategy implements TradingStrategy {
             }
 
             /* =====================================================
-             *  2️⃣ 공통 진입 필터 (너무 강하지 않게)
+             *  2️⃣ 공통 진입 필터 (완화)
              * ===================================================== */
             boolean commonEntryFilter =
-                    volumeIncreaseRate >= 120
-                            && bandWidthPercent >= 1.2
-                            && bandWidthPercent > prevBandWidthPercent * 1.05
+                    volumeIncreaseRate >= 100  // 120 → 100 (완화)
+                            && bandWidthPercent >= 0.8  // 1.2 → 0.8 (완화)
+                            && bandWidthPercent > prevBandWidthPercent * 1.02  // 1.05 → 1.02 (완화)
                             && risingTrend;
 
             if (!commonEntryFilter) {
-                log.info("[{}] 진입 필터 volumeIncreaseRate : {}, bandWidthPercent : {}, prevBandWidthPercent * 1.05 : {}, risingTrend",
-                        market, volumeIncreaseRate, bandWidthPercent, prevBandWidthPercent * 1.05, risingTrend);
+                log.debug("[{}] 진입 필터 미충족 - vol: {}, bw: {}, prevBw: {}, trend: {}",
+                        market, String.format("%.1f", volumeIncreaseRate),
+                        String.format("%.2f", bandWidthPercent),
+                        String.format("%.2f", prevBandWidthPercent * 1.02), risingTrend);
                 return 0;
             }
 
@@ -165,9 +167,9 @@ public class BollingerBandStrategy implements TradingStrategy {
                 return 0;
             }
 
-            // ❌ RSI 피로 구간
-            if (rsi > 62) {
-                log.info("[{}] RSI 피로 구간 : {}", market, rsi);
+            // ❌ RSI 피로 구간 (완화: 62 → 68)
+            if (rsi > 68) {
+                log.debug("[{}] RSI 피로 구간 : {}", market, rsi);
                 return 0;
             }
 
@@ -284,10 +286,11 @@ public class BollingerBandStrategy implements TradingStrategy {
 
     private double getMinTradeAmountByTime() {
         int hour = LocalTime.now().getHour();
-        if (hour >= 2 && hour < 9) return 50_000_000;
-        if (hour >= 9 && hour < 18) return 120_000_000;
-        if (hour >= 18 && hour < 22) return 180_000_000;
-        return 220_000_000;
+        // 완화: 기존 대비 50% 수준으로 낮춤
+        if (hour >= 2 && hour < 9) return 20_000_000;   // 새벽: 5천만 → 2천만
+        if (hour >= 9 && hour < 18) return 50_000_000;  // 낮: 1.2억 → 5천만
+        if (hour >= 18 && hour < 22) return 80_000_000; // 저녁: 1.8억 → 8천만
+        return 100_000_000;                              // 밤: 2.2억 → 1억
     }
 
     @Override

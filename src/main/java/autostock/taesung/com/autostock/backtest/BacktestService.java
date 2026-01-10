@@ -921,4 +921,154 @@ public class BacktestService {
         List<Candle> candles = convertToCandles(candleDataList);
         return executeRealTradingSimulation(market, candles, initialBalance);
     }
+
+    /**
+     * DB 데이터를 사용한 단일 전략 백테스팅
+     */
+    public BacktestResult runBacktestWithStrategyFromDb(String market, String strategyName,
+                                                         double initialBalance, Integer unit) {
+        log.info("========== DB 데이터 기반 {} 전략 백테스팅 시작 ==========", strategyName);
+
+        List<CandleData> candleDataList;
+        if (unit != null) {
+            candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
+        } else {
+            candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
+        }
+
+        if (candleDataList.isEmpty()) {
+            throw new RuntimeException("DB에 해당 마켓의 캔들 데이터가 없습니다: " + market);
+        }
+
+        List<Candle> candles = convertToCandles(candleDataList);
+        log.info("DB에서 {}개의 캔들 데이터 로드 완료", candles.size());
+
+        TradingStrategy selectedStrategy = strategies.stream()
+                .filter(s -> s.getStrategyName().equalsIgnoreCase(strategyName))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("전략을 찾을 수 없습니다: " + strategyName));
+
+        return executeBacktestSingleStrategy(market, selectedStrategy, candles, initialBalance);
+    }
+
+    /**
+     * DB 데이터를 사용한 멀티 코인 단일 전략 백테스팅
+     */
+    public MultiCoinBacktestResult runMultiCoinBacktestFromDb(List<String> markets, String strategyName,
+                                                               double initialBalancePerMarket, Integer unit) {
+        log.info("========== DB 데이터 기반 멀티 코인 백테스팅 시작 ==========");
+        log.info("마켓 수: {}, 전략: {}, 마켓당 자본: {}", markets.size(), strategyName, initialBalancePerMarket);
+
+        List<BacktestResult> marketResults = new ArrayList<>();
+        Map<String, Double> profitRateByMarket = new LinkedHashMap<>();
+
+        TradingStrategy selectedStrategy = null;
+        if (strategyName != null && !strategyName.isEmpty()) {
+            selectedStrategy = strategies.stream()
+                    .filter(s -> s.getStrategyName().equalsIgnoreCase(strategyName))
+                    .findFirst()
+                    .orElse(null);
+        }
+
+        for (String market : markets) {
+            try {
+                log.info("DB 백테스팅 진행 중: {}", market);
+
+                List<CandleData> candleDataList;
+                if (unit != null) {
+                    candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
+                } else {
+                    candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
+                }
+
+                if (candleDataList.isEmpty() || candleDataList.size() < 50) {
+                    log.warn("{} DB 캔들 데이터 부족 ({}개), 스킵", market, candleDataList.size());
+                    continue;
+                }
+
+                List<Candle> candles = convertToCandles(candleDataList);
+
+                BacktestResult result;
+                if (selectedStrategy != null) {
+                    result = executeBacktestSingleStrategy(market, selectedStrategy, candles, initialBalancePerMarket);
+                } else {
+                    result = executeBacktest(market, "Combined", candles, initialBalancePerMarket);
+                }
+
+                marketResults.add(result);
+                profitRateByMarket.put(market, result.getTotalProfitRate());
+
+            } catch (Exception e) {
+                log.error("{} DB 백테스팅 실패: {}", market, e.getMessage());
+            }
+        }
+
+        if (marketResults.isEmpty()) {
+            throw new RuntimeException("DB 백테스팅 결과가 없습니다.");
+        }
+
+        // 통계 계산
+        double totalFinalAsset = marketResults.stream()
+                .mapToDouble(BacktestResult::getFinalTotalAsset)
+                .sum();
+
+        double totalInitialBalance = initialBalancePerMarket * marketResults.size();
+        double totalProfitRate = ((totalFinalAsset - totalInitialBalance) / totalInitialBalance) * 100;
+        double averageProfitRate = marketResults.stream()
+                .mapToDouble(BacktestResult::getTotalProfitRate)
+                .average()
+                .orElse(0);
+        double averageWinRate = marketResults.stream()
+                .mapToDouble(BacktestResult::getWinRate)
+                .average()
+                .orElse(0);
+
+        int profitableMarkets = (int) marketResults.stream()
+                .filter(r -> r.getTotalProfitRate() > 0)
+                .count();
+        int losingMarkets = marketResults.size() - profitableMarkets;
+
+        BacktestResult best = marketResults.stream()
+                .max(Comparator.comparing(BacktestResult::getTotalProfitRate))
+                .orElse(null);
+
+        BacktestResult worst = marketResults.stream()
+                .min(Comparator.comparing(BacktestResult::getTotalProfitRate))
+                .orElse(null);
+
+        log.info("========== DB 멀티 코인 백테스팅 완료 ==========");
+        log.info("총 수익률: {}%, 평균 수익률: {}%",
+                String.format("%.2f", totalProfitRate), String.format("%.2f", averageProfitRate));
+        log.info("수익 마켓: {}, 손실 마켓: {}", profitableMarkets, losingMarkets);
+
+        return MultiCoinBacktestResult.builder()
+                .strategy(strategyName != null ? strategyName + " (DB Data)" : "Combined (DB Data)")
+                .totalMarkets(marketResults.size())
+                .initialBalancePerMarket(initialBalancePerMarket)
+                .totalInitialBalance(totalInitialBalance)
+                .totalFinalAsset(Math.round(totalFinalAsset * 100.0) / 100.0)
+                .totalProfitRate(Math.round(totalProfitRate * 100.0) / 100.0)
+                .averageProfitRate(Math.round(averageProfitRate * 100.0) / 100.0)
+                .averageWinRate(Math.round(averageWinRate * 10.0) / 10.0)
+                .profitableMarkets(profitableMarkets)
+                .losingMarkets(losingMarkets)
+                .bestMarket(best != null ? best.getMarket() : null)
+                .bestMarketProfitRate(best != null ? best.getTotalProfitRate() : null)
+                .worstMarket(worst != null ? worst.getMarket() : null)
+                .worstMarketProfitRate(worst != null ? worst.getTotalProfitRate() : null)
+                .marketResults(marketResults)
+                .profitRateByMarket(profitRateByMarket)
+                .build();
+    }
+
+    /**
+     * DB에 저장된 마켓 목록 조회
+     */
+    public List<String> getAvailableMarketsFromDb() {
+        List<CandleData> allData = candleDataRepository.findAll();
+        return allData.stream()
+                .map(CandleData::getMarket)
+                .distinct()
+                .collect(Collectors.toList());
+    }
 }
