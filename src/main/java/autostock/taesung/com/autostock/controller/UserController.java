@@ -2,6 +2,7 @@ package autostock.taesung.com.autostock.controller;
 
 import autostock.taesung.com.autostock.entity.User;
 import autostock.taesung.com.autostock.repository.UserRepository;
+import autostock.taesung.com.autostock.service.ApiKeyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -18,6 +19,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class UserController {
 
+    private final ApiKeyService apiKeyService;
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
 
@@ -83,9 +85,7 @@ public class UserController {
             return ResponseEntity.badRequest()
                     .body(Map.of("message", "accessKey와 secretKey가 필요합니다."));
         }
-
-        user.setUpbitAccessKey(accessKey);
-        user.setUpbitSecretKey(secretKey);
+        apiKeyService.saveUpbitApiKeys(user.getId(), accessKey, secretKey);
         userRepository.save(user);
 
         log.info("사용자 {} Upbit API 키 업데이트", user.getUsername());
