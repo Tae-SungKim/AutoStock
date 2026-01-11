@@ -96,9 +96,36 @@ public class DashboardService {
      * 대시보드 전체 데이터 조회
      */
     public DashboardData getDashboardData(User user) {
+        log.info("대시보드 데이터 조회 시작 - userId: {}", user.getId());
         try {
+            // API 키 확인
+            if (user.getUpbitAccessKey() == null || user.getUpbitSecretKey() == null) {
+                log.warn("대시보드 조회 실패: API 키가 설정되지 않음 - userId: {}", user.getId());
+                return DashboardData.builder()
+                        .totalAsset(0)
+                        .krwBalance(0)
+                        .coinEvaluation(0)
+                        .totalProfitLoss(0)
+                        .totalProfitLossRate(0)
+                        .assets(new ArrayList<>())
+                        .todayTradeCount(0)
+                        .totalTradeCount(0)
+                        .todayProfitLoss(0)
+                        .winRate(0)
+                        .marketStatus(null)
+                        .recentTrades(new ArrayList<>())
+                        .profitChart(new ArrayList<>())
+                        .updatedAt(LocalDateTime.now())
+                        .build();
+            }
+
             // 계좌 정보 조회
-            List<Account> accounts = upbitApiService.getAccounts(user);
+            log.debug("계좌 정보 조회 중...");
+            List<Account> accounts = upbitApiService.getAccounts(user)
+                    .stream()
+                    .filter(it->"KRW".equals(it.getCurrency()) || (Double.parseDouble(it.getBalance()) * Double.parseDouble(it.getAvgBuyPrice()) >= 1))
+                    .toList();
+            log.debug("계좌 정보 조회 완료 - {} 개 계좌", accounts != null ? accounts.size() : 0);
 
             double krwBalance = 0;
             double totalCoinEvaluation = 0;
@@ -205,10 +232,22 @@ public class DashboardService {
                     .build();
 
         } catch (Exception e) {
-            log.error("대시보드 데이터 조회 오류: {}", e.getMessage());
+            log.error("대시보드 데이터 조회 오류: {}", e.getMessage(), e);
+            // 에러 발생 시에도 최소한의 정보 제공
             return DashboardData.builder()
                     .totalAsset(0)
+                    .krwBalance(0)
+                    .coinEvaluation(0)
+                    .totalProfitLoss(0)
+                    .totalProfitLossRate(0)
                     .assets(new ArrayList<>())
+                    .todayTradeCount(0)
+                    .totalTradeCount(0)
+                    .todayProfitLoss(0)
+                    .winRate(0)
+                    .marketStatus(null)
+                    .recentTrades(new ArrayList<>())
+                    .profitChart(new ArrayList<>())
                     .updatedAt(LocalDateTime.now())
                     .build();
         }
