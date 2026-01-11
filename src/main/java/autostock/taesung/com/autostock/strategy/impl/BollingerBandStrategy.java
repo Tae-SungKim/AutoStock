@@ -103,7 +103,7 @@ public class BollingerBandStrategy implements TradingStrategy {
                     highest = currentPrice;
                 }
 
-                double stopLoss = buyPrice - atr * 0.8;
+                double stopLoss = buyPrice - atr * 1.4;
                 double takeProfit = buyPrice + atr * 1.4;
                 double trailingStop = highest - atr;
 
