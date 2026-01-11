@@ -13,6 +13,7 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -20,12 +21,18 @@ import java.util.List;
 @Component
 @RequiredArgsConstructor
 public class BollingerBandStrategy implements TradingStrategy {
-    private static final int STOP_LOSS_COOLDOWN_CANDLES = 3;
+    private static final int STOP_LOSS_COOLDOWN_CANDLES = 5;  // 손절 후 재진입 대기 캔들
+    private static final int MIN_HOLD_CANDLES = 3;            // 최소 보유 캔들 (손절 체크 전)
     private final TechnicalIndicator indicator;
     private final TradeHistoryRepository tradeHistoryRepository;
 
     private static final int PERIOD = 20;
     private static final double STD_DEV_MULTIPLIER = 2;
+
+    // ATR 배수 (완화: 손절 여유 확보)
+    private static final double STOP_LOSS_ATR_MULT = 2.0;     // 1.4 → 2.0
+    private static final double TAKE_PROFIT_ATR_MULT = 2.5;   // 1.4 → 2.5
+    private static final double TRAILING_STOP_ATR_MULT = 1.5; // 1.0 → 1.5
 
     private Double targetPrice = null;
 
@@ -103,22 +110,32 @@ public class BollingerBandStrategy implements TradingStrategy {
                     highest = currentPrice;
                 }
 
-                double stopLoss = buyPrice - atr * 1.4;
-                double takeProfit = buyPrice + atr * 1.4;
-                double trailingStop = highest - atr;
+                // 새 상수 적용
+                double stopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
+                double takeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
+                double trailingStop = highest - atr * TRAILING_STOP_ATR_MULT;
 
-                if (currentPrice <= stopLoss) {
-                    log.info("[{}] 손절", market);
+                // 최소 보유 시간 체크 (MIN_HOLD_CANDLES 캔들 이후부터 손절 체크)
+                long holdingMinutes = java.time.Duration.between(
+                        latest.getCreatedAt(), java.time.LocalDateTime.now()).toMinutes();
+                boolean canCheckStopLoss = holdingMinutes >= MIN_HOLD_CANDLES;  // 캔들 단위 = 분 가정
+
+                if (canCheckStopLoss && currentPrice <= stopLoss) {
+                    log.info("[{}] 손절 (보유 {}분, 매수가: {}, 현재가: {}, 손절선: {})",
+                            market, holdingMinutes, buyPrice, currentPrice, stopLoss);
                     return -1;
                 }
 
                 if (currentPrice >= takeProfit && rsi > 70) {
-                    log.info("[{}] 익절", market);
+                    log.info("[{}] 익절 (매수가: {}, 현재가: {}, 익절선: {})",
+                            market, buyPrice, currentPrice, takeProfit);
                     return -1;
                 }
 
-                if (currentPrice <= trailingStop) {
-                    log.info("[{}] 트레일링 종료", market);
+                if (canCheckStopLoss && currentPrice <= trailingStop && highest > buyPrice * 1.01) {
+                    // 최소 1% 이상 올랐을 때만 트레일링 적용
+                    log.info("[{}] 트레일링 종료 (최고가: {}, 현재가: {}, 트레일링선: {})",
+                            market, highest, currentPrice, trailingStop);
                     return -1;
                 }
 
@@ -126,7 +143,20 @@ public class BollingerBandStrategy implements TradingStrategy {
             }
 
             /* =====================================================
-             *  2️⃣ 공통 진입 필터 (완화)
+             *  2️⃣ 손절 후 쿨다운 체크
+             * ===================================================== */
+            if (latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL) {
+                long minutesSinceLastSell = java.time.Duration.between(
+                        latest.getCreatedAt(), java.time.LocalDateTime.now()).toMinutes();
+                if (minutesSinceLastSell < STOP_LOSS_COOLDOWN_CANDLES) {
+                    log.debug("[{}] 손절 쿨다운 중 ({}분 경과, {}분 필요)",
+                            market, minutesSinceLastSell, STOP_LOSS_COOLDOWN_CANDLES);
+                    return 0;
+                }
+            }
+
+            /* =====================================================
+             *  3️⃣ 공통 진입 필터 (완화)
              * ===================================================== */
             boolean commonEntryFilter =
                     volumeIncreaseRate >= 100  // 120 → 100 (완화)
@@ -285,12 +315,13 @@ public class BollingerBandStrategy implements TradingStrategy {
     }
 
     private double getMinTradeAmountByTime() {
-        int hour = LocalTime.now().getHour();
+        // 한국 시간대 명시적 지정 (서버 시간대 무관)
+        int hour = LocalTime.now(ZoneId.of("Asia/Seoul")).getHour();
         // 완화: 기존 대비 50% 수준으로 낮춤
-        if (hour >= 2 && hour < 9) return 20_000_000;   // 새벽: 5천만 → 2천만
-        if (hour >= 9 && hour < 18) return 50_000_000;  // 낮: 1.2억 → 5천만
-        if (hour >= 18 && hour < 22) return 80_000_000; // 저녁: 1.8억 → 8천만
-        return 100_000_000;                              // 밤: 2.2억 → 1억
+        if (hour >= 2 && hour < 9) return 20_000_000;   // 새벽 02~09시: 2천만
+        if (hour >= 9 && hour < 18) return 50_000_000;  // 낮 09~18시: 5천만
+        if (hour >= 18 && hour < 22) return 80_000_000; // 저녁 18~22시: 8천만
+        return 100_000_000;                              // 밤 22~02시: 1억
     }
 
     @Override
