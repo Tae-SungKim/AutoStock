@@ -379,7 +379,7 @@ public class DataDrivenStrategy implements TradingStrategy {
 
     @Override
     public String getStrategyName() {
-        return "BollingerBandStrategy";
+        return "BollingerBandStrategy_Data";
     }
 
     /**
