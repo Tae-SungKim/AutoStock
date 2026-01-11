@@ -5,8 +5,8 @@ import autostock.taesung.com.autostock.repository.StrategyParameterRepository;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
 import lombok.Builder;
 import lombok.Data;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,11 +19,15 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class StrategyParameterService {
 
     private final StrategyParameterRepository parameterRepository;
     private final List<TradingStrategy> strategies;
+
+    public StrategyParameterService(StrategyParameterRepository parameterRepository, @Lazy List<TradingStrategy> strategies) {
+        this.parameterRepository = parameterRepository;
+        this.strategies = strategies;
+    }
 
     /**
      * 파라미터 정의
@@ -77,11 +81,11 @@ public class StrategyParameterService {
                         .type(StrategyParameter.ParamType.INTEGER).defaultValue("14")
                         .minValue(5.0).maxValue(50.0).build(),
                 ParameterDefinition.builder()
-                        .key("rsi.oversold").name("RSI 과매도").description("매수 신호 기준 RSI 값")
+                        .key("rsi.oversold").name("RSI 매수").description("매수 신호 기준 RSI 값")
                         .type(StrategyParameter.ParamType.DOUBLE).defaultValue("30")
                         .minValue(10.0).maxValue(50.0).build(),
                 ParameterDefinition.builder()
-                        .key("rsi.overbought").name("RSI 과매수").description("매도 신호 기준 RSI 값")
+                        .key("rsi.overbought").name("RSI 매도").description("매도 신호 기준 RSI 값")
                         .type(StrategyParameter.ParamType.DOUBLE).defaultValue("70")
                         .minValue(50.0).maxValue(90.0).build(),
                 ParameterDefinition.builder()
@@ -90,15 +94,15 @@ public class StrategyParameterService {
                         .minValue(50.0).maxValue(500.0).build(),
                 ParameterDefinition.builder()
                         .key("stopLoss.rate").name("손절률").description("손절 기준 (%)")
-                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("-3.0")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("-2.5")
                         .minValue(-10.0).maxValue(-0.5).build(),
                 ParameterDefinition.builder()
                         .key("takeProfit.rate").name("익절률").description("익절 기준 (%)")
-                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("5.0")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("3.0")
                         .minValue(1.0).maxValue(20.0).build(),
                 ParameterDefinition.builder()
                         .key("trailingStop.rate").name("트레일링 스탑").description("고점 대비 하락 매도 기준 (%)")
-                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("2.0")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("1.5")
                         .minValue(0.5).maxValue(10.0).build()
         ));
 
@@ -145,6 +149,7 @@ public class StrategyParameterService {
                         .type(StrategyParameter.ParamType.INTEGER).defaultValue("20")
                         .minValue(10.0).maxValue(100.0).build()
         ));
+
     }
 
     /**

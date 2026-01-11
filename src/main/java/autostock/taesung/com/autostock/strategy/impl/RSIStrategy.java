@@ -3,6 +3,7 @@ package autostock.taesung.com.autostock.strategy.impl;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.strategy.TechnicalIndicator;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
+import autostock.taesung.com.autostock.service.StrategyParameterService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -21,6 +22,7 @@ import java.util.List;
 public class RSIStrategy implements TradingStrategy {
 
     private final TechnicalIndicator indicator;
+    private final StrategyParameterService strategyParameterService;
 
     private static final int RSI_PERIOD = 14;
     private static final double OVERSOLD_THRESHOLD = 25.0;   // 과매도 기준 (더 엄격하게)
@@ -28,17 +30,26 @@ public class RSIStrategy implements TradingStrategy {
 
     @Override
     public int analyze(List<Candle> candles) {
+        return analyze("UNKNOWN", candles);
+    }
+
+    @Override
+    public int analyze(String market, List<Candle> candles) {
         try {
-            if (candles.size() < RSI_PERIOD + 2) {
+            int period = strategyParameterService.getIntParam(getStrategyName(), null, "rsi.period", RSI_PERIOD);
+            double oversold = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.oversold", OVERSOLD_THRESHOLD);
+            double overbought = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.overbought", OVERBOUGHT_THRESHOLD);
+
+            if (candles.size() < period + 2) {
                 return 0;
             }
 
             // 현재 RSI
-            double currentRsi = indicator.calculateRSI(candles, RSI_PERIOD);
+            double currentRsi = indicator.calculateRSI(candles, period);
 
             // 이전 RSI (1캔들 전)
             List<Candle> prevCandles = candles.subList(1, candles.size());
-            double prevRsi = indicator.calculateRSI(prevCandles, RSI_PERIOD);
+            double prevRsi = indicator.calculateRSI(prevCandles, period);
 
             // RSI 변화량
             double rsiChange = currentRsi - prevRsi;
@@ -54,14 +65,14 @@ public class RSIStrategy implements TradingStrategy {
                     isBullish);
 
             // 매수: 과매도 구간에서 RSI가 상승 반전 + 양봉
-            if (currentRsi <= OVERSOLD_THRESHOLD + 10 && prevRsi <= OVERSOLD_THRESHOLD && rsiChange > 0 && isBullish) {
+            if (currentRsi <= oversold + 10 && prevRsi <= oversold && rsiChange > 0 && isBullish) {
                 log.info("[RSI 전략] 과매도 반전 - 매수 신호 (RSI: {} -> {})",
                         String.format("%.1f", prevRsi), String.format("%.1f", currentRsi));
                 return 1;
             }
 
             // 매도: 과매수 구간에서 RSI가 하락 반전 + 음봉
-            if (currentRsi >= OVERBOUGHT_THRESHOLD - 10 && prevRsi >= OVERBOUGHT_THRESHOLD && rsiChange < 0 && isBearish) {
+            if (currentRsi >= overbought - 10 && prevRsi >= overbought && rsiChange < 0 && isBearish) {
                 log.info("[RSI 전략] 과매수 반전 - 매도 신호 (RSI: {} -> {})",
                         String.format("%.1f", prevRsi), String.format("%.1f", currentRsi));
                 return -1;

@@ -6,6 +6,7 @@ import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
 import autostock.taesung.com.autostock.strategy.TechnicalIndicator;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
+import autostock.taesung.com.autostock.service.StrategyParameterService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
@@ -16,6 +17,7 @@ import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @Component
@@ -25,6 +27,7 @@ public class BollingerBandStrategy implements TradingStrategy {
     private static final int MIN_HOLD_CANDLES = 3;            // 최소 보유 캔들 (손절 체크 전)
     private final TechnicalIndicator indicator;
     private final TradeHistoryRepository tradeHistoryRepository;
+    private final StrategyParameterService strategyParameterService;
 
     private static final int PERIOD = 20;
     private static final double STD_DEV_MULTIPLIER = 2;
@@ -45,6 +48,16 @@ public class BollingerBandStrategy implements TradingStrategy {
      * ===================================================== */
     @Override
     public int analyze(String market, List<Candle> candles) {
+        // 동적 파라미터 로드 (글로벌 우선)
+        int period = strategyParameterService.getIntParam(getStrategyName(), null, "bollinger.period", PERIOD);
+        double multiplier = strategyParameterService.getDoubleParam(getStrategyName(), null, "bollinger.multiplier", STD_DEV_MULTIPLIER);
+        double stopLossRate = strategyParameterService.getDoubleParam(getStrategyName(), null, "stopLoss.rate", -2.5);
+        double takeProfitRate = strategyParameterService.getDoubleParam(getStrategyName(), null, "takeProfit.rate", 2.0);
+        double volumeThreshold = strategyParameterService.getDoubleParam(getStrategyName(), null, "volume.threshold", 100.0);
+        double rsiOversold = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.oversold", 30.0);
+        double rsiOverbought = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.overbought", 70.0);
+        int rsiPeriod = strategyParameterService.getIntParam(getStrategyName(), null, "rsi.period", 14);
+
         try {
             TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
                     .stream().findFirst().orElse(null);
@@ -55,23 +68,23 @@ public class BollingerBandStrategy implements TradingStrategy {
             /* =======================
              *  지표 계산
              * ======================= */
-            double[] bands = indicator.calculateBollingerBands(candles, PERIOD, STD_DEV_MULTIPLIER);
+            double[] bands = indicator.calculateBollingerBands(candles, period, multiplier);
             double middleBand = bands[0];
             double upperBand = bands[1];
             double lowerBand = bands[2];
 
             List<Candle> prevCandles = candles.subList(1, candles.size());
-            double[] prevBands = indicator.calculateBollingerBands(prevCandles, PERIOD, STD_DEV_MULTIPLIER);
+            double[] prevBands = indicator.calculateBollingerBands(prevCandles, period, multiplier);
 
             double bandWidthPercent =
                     ((upperBand - lowerBand) / middleBand) * 100;
             double prevBandWidthPercent =
                     ((prevBands[1] - prevBands[2]) / prevBands[0]) * 100;
 
-            double rsi = calculateRSI(candles, 14);
-            double atr = calculateATR(candles, 14);
+            double rsi = calculateRSI(candles, rsiPeriod);
+            double atr = calculateATR(candles, rsiPeriod);
 
-            double[] stoch = calculateStochRSI(candles, 14, 14);
+            double[] stoch = calculateStochRSI(candles, rsiPeriod, rsiPeriod);
             double stochK = stoch[0];
             double stochD = stoch[1];
 
@@ -92,7 +105,7 @@ public class BollingerBandStrategy implements TradingStrategy {
             double volumeIncreaseRate = (currentVolume / avgPrevVolume) * 100;
 
             boolean risingTrend =
-                    isMiddleBandRising(candles)
+                    isMiddleBandRising(candles, period)
                             || currentPrice > middleBand * 1.001;
 
             /* =====================================================
@@ -110,9 +123,16 @@ public class BollingerBandStrategy implements TradingStrategy {
                     highest = currentPrice;
                 }
 
-                // 새 상수 적용
-                double stopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
-                double takeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
+                // 최적화된 고정 비율 손절과 ATR 기반 동적 손절 중 더 타이트한 것 적용
+                double fixedStopLoss = buyPrice * (1 + stopLossRate / 100);
+                double atrStopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
+                double stopLoss = Math.max(fixedStopLoss, atrStopLoss);
+
+                // 최적화된 고정 비율 익절과 ATR 기반 동적 익절 중 더 타이트한 것 적용
+                double fixedTakeProfit = buyPrice * (1 + takeProfitRate / 100);
+                double atrTakeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
+                double takeProfit = Math.min(fixedTakeProfit, atrTakeProfit);
+
                 double trailingStop = highest - atr * TRAILING_STOP_ATR_MULT;
 
                 // 최소 보유 시간 체크 (MIN_HOLD_CANDLES 캔들 이후부터 손절 체크)
@@ -126,7 +146,7 @@ public class BollingerBandStrategy implements TradingStrategy {
                     return -1;
                 }
 
-                if (currentPrice >= takeProfit && rsi > 70) {
+                if (currentPrice >= takeProfit && rsi > rsiOverbought) {
                     log.info("[{}] 익절 (매수가: {}, 현재가: {}, 익절선: {})",
                             market, buyPrice, currentPrice, takeProfit);
                     return -1;
@@ -158,17 +178,9 @@ public class BollingerBandStrategy implements TradingStrategy {
             /* =====================================================
              *  3️⃣ 공통 진입 필터 (완화)
              * ===================================================== */
-            boolean commonEntryFilter =
-                    volumeIncreaseRate >= 100  // 120 → 100 (완화)
-                            && bandWidthPercent >= 0.8  // 1.2 → 0.8 (완화)
-                            && bandWidthPercent > prevBandWidthPercent * 1.02  // 1.05 → 1.02 (완화)
-                            && risingTrend;
-
-            if (!commonEntryFilter) {
-                log.debug("[{}] 진입 필터 미충족 - vol: {}, bw: {}, prevBw: {}, trend: {}",
-                        market, String.format("%.1f", volumeIncreaseRate),
-                        String.format("%.2f", bandWidthPercent),
-                        String.format("%.2f", prevBandWidthPercent * 1.02), risingTrend);
+            // 밴드폭 필터 (최적화 결과 반영: 최소 0.8% 이상 벌어졌을 때)
+            if (bandWidthPercent < 0.8) {
+                log.debug("[{}] 밴드폭 협소 : {:.2f}%", market, bandWidthPercent);
                 return 0;
             }
 
@@ -197,8 +209,8 @@ public class BollingerBandStrategy implements TradingStrategy {
                 return 0;
             }
 
-            // ❌ RSI 피로 구간 (완화: 62 → 68)
-            if (rsi > 68) {
+            // RSI 피로 구간 (최적화 파라미터 적용)
+            if (rsi > rsiOverbought) {
                 log.debug("[{}] RSI 피로 구간 : {}", market, rsi);
                 return 0;
             }
@@ -210,14 +222,14 @@ public class BollingerBandStrategy implements TradingStrategy {
             // StochRSI 초입 (주력)
             boolean stochEntry =
                     stochK > stochD
-                            && stochK > 0.15
-                            && stochK < 0.6
-                            && rsi > 45
-                            && currentPrice > middleBand;
+                            && stochK < 0.8
+                            && rsi > rsiOversold
+                            && currentPrice > middleBand * 0.98;
 
-            // RSI 보조
-            boolean rsiEntry =
-                    rsi >= 50 && rsi <= 65
+            // RSI + 거래량 동반 돌파 (최적화 로직 반영)
+            boolean volumeBreakout =
+                    rsi > 45
+                            && volumeIncreaseRate >= volumeThreshold
                             && currentPrice > middleBand;
 
             /* =====================================================
@@ -235,11 +247,11 @@ public class BollingerBandStrategy implements TradingStrategy {
             }
 
             /* =====================================================
-             *  6️⃣ 매수
-             * ===================================================== */
-            if (stochEntry || rsiEntry) {
+            *  6️⃣ 매수
+            * ===================================================== */
+            if (stochEntry || volumeBreakout) {
                 this.targetPrice = currentPrice + atr * 1.5;
-                log.info("[{}] 매수 (stoch={}, rsi={})", market, stochEntry, rsiEntry);
+                log.info("[{}] 매수 (stoch={}, volumeBreakout={})", market, stochEntry, volumeBreakout);
                 return 1;
             }
 
@@ -308,9 +320,9 @@ public class BollingerBandStrategy implements TradingStrategy {
         return new double[]{k, d};
     }
 
-    private boolean isMiddleBandRising(List<Candle> candles) {
-        double prev = indicator.calculateSMA(candles.subList(1, candles.size()), PERIOD);
-        double current = indicator.calculateSMA(candles, PERIOD);
+    private boolean isMiddleBandRising(List<Candle> candles, int period) {
+        double prev = indicator.calculateSMA(candles.subList(1, candles.size()), period);
+        double current = indicator.calculateSMA(candles, period);
         return current > prev;
     }
 
