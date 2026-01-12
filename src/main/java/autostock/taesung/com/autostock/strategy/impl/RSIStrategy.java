@@ -1,5 +1,7 @@
 package autostock.taesung.com.autostock.strategy.impl;
 
+import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
+import autostock.taesung.com.autostock.backtest.dto.ExitReason;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.strategy.TechnicalIndicator;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
@@ -83,6 +85,26 @@ public class RSIStrategy implements TradingStrategy {
             log.error("[RSI 전략] 분석 실패: {}", e.getMessage());
             return 0;
         }
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        if (position != null && position.isHolding()) {
+            double currentPrice = candles.get(0).getTradePrice().doubleValue();
+            double buyPrice = position.getBuyPrice();
+            double profitRate = (currentPrice - buyPrice) / buyPrice;
+
+            // 기본 손절/익절
+            if (profitRate <= -0.02) return exit(ExitReason.STOP_LOSS_FIXED);
+            if (profitRate >= 0.03) return exit(ExitReason.TAKE_PROFIT);
+            
+            // RSI 기반 매도 신호 확인
+            int signal = analyze(market, candles);
+            if (signal == -1) return exit(ExitReason.SIGNAL_INVALID);
+            
+            return 0;
+        }
+        return analyze(market, candles);
     }
 
     @Override

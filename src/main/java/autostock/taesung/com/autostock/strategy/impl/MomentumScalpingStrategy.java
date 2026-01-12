@@ -1,5 +1,7 @@
 package autostock.taesung.com.autostock.strategy.impl;
 
+import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
+import autostock.taesung.com.autostock.backtest.dto.ExitReason;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
 import lombok.extern.slf4j.Slf4j;
@@ -114,6 +116,29 @@ public class MomentumScalpingStrategy implements TradingStrategy {
             log.error("[급등단타] 분석 실패: {}", e.getMessage());
             return 0;
         }
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        if (candles.size() < VOLUME_LOOKBACK + 5) return 0;
+
+        Candle current = candles.get(0);
+        double currentPrice = current.getTradePrice().doubleValue();
+
+        if (position != null && position.isHolding()) {
+            double buyPrice = position.getBuyPrice();
+            double profitRate = (currentPrice - buyPrice) / buyPrice;
+
+            boolean isBearish = current.getTradePrice().compareTo(current.getOpeningPrice()) < 0;
+
+            if (profitRate >= 0.025) return exit(ExitReason.TAKE_PROFIT);
+            if (profitRate <= -0.015) return exit(ExitReason.STOP_LOSS_FIXED);
+            if (isBearish) return exit(ExitReason.SIGNAL_INVALID); // 상승 추세 꺾임
+
+            return 0;
+        }
+
+        return analyze(market, candles);
     }
 
     @Override

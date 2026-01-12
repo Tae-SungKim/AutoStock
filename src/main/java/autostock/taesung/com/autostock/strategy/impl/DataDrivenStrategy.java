@@ -1,5 +1,7 @@
 package autostock.taesung.com.autostock.strategy.impl;
 
+import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
+import autostock.taesung.com.autostock.backtest.dto.ExitReason;
 import autostock.taesung.com.autostock.entity.TradeHistory;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
@@ -378,8 +380,44 @@ public class DataDrivenStrategy implements TradingStrategy {
     }
 
     @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        if (candles.size() < 30) return 0;
+
+        StrategyOptimizerService.OptimizedParams params = getParams(market);
+        boolean holding = position != null && position.isHolding();
+        double currentPrice = candles.get(0).getTradePrice().doubleValue();
+
+        if (holding) {
+            double buyPrice = position.getBuyPrice();
+            double highest = position.getHighestPrice();
+
+            // 손절
+            if (currentPrice <= buyPrice * (1 + params.getStopLossRate() / 100)) {
+                return exit(ExitReason.STOP_LOSS_FIXED);
+            }
+
+            // 익절
+            if (currentPrice >= buyPrice * (1 + params.getTakeProfitRate() / 100)) {
+                return exit(ExitReason.TAKE_PROFIT);
+            }
+
+            // 트레일링 스탑
+            if (highest > buyPrice * 1.01 && currentPrice <= highest * (1 - params.getTrailingStopRate() / 100)) {
+                return exit(ExitReason.TRAILING_STOP);
+            }
+
+            // 타임아웃 (예시: 60분 이상 보유 시)
+            // (BacktestPosition에 진입시간이 없으므로 필요 시 추가 확장 가능하나, 여기서는 생략하거나 추측 구현 지양)
+
+            return 0;
+        }
+
+        return analyze(market, candles);
+    }
+
+    @Override
     public String getStrategyName() {
-        return "BollingerBandStrategy_Data";
+        return "DataDrivenStrategy";
     }
 
     /**

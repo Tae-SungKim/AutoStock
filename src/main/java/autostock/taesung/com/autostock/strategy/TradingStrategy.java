@@ -1,6 +1,8 @@
 package autostock.taesung.com.autostock.strategy;
 
+import autostock.taesung.com.autostock.backtest.context.BacktestContext;
 import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
+import autostock.taesung.com.autostock.backtest.dto.ExitReason;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 
 import java.util.List;
@@ -22,6 +24,14 @@ public interface TradingStrategy {
      */
     default int analyze(String market, List<Candle> candles) {
         return analyze(candles);
+    }
+
+    /**
+     * 종료 사유 설정 헬퍼 메서드
+     */
+    default int exit(ExitReason reason) {
+        BacktestContext.setExitReason(reason);
+        return -1;
     }
 
     /**

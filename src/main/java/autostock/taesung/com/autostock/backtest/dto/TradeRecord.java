@@ -16,4 +16,5 @@ public class TradeRecord {
     private Double totalAsset;          // 총 자산 (KRW + 코인가치)
     private Double profitRate;          // 현재 수익률 (%)
     private String strategy;            // 매매 신호를 준 전략
+    private ExitReason exitReason;      // 종료 사유 (SELL인 경우)
 }

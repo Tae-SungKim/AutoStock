@@ -33,4 +33,7 @@ public class MultiCoinBacktestResult {
 
     // 마켓별 수익률 요약
     private Map<String, Double> profitRateByMarket;
+
+    // 통합 종료 사유 통계
+    private Map<ExitReason, Integer> totalExitReasonStats;
 }

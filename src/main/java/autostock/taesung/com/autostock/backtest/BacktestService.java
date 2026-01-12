@@ -1,9 +1,7 @@
 package autostock.taesung.com.autostock.backtest;
 
-import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
-import autostock.taesung.com.autostock.backtest.dto.BacktestResult;
-import autostock.taesung.com.autostock.backtest.dto.MultiCoinBacktestResult;
-import autostock.taesung.com.autostock.backtest.dto.TradeRecord;
+import autostock.taesung.com.autostock.backtest.context.BacktestContext;
+import autostock.taesung.com.autostock.backtest.dto.*;
 import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Market;
@@ -105,6 +103,7 @@ public class BacktestService {
 
         List<BacktestResult> marketResults = new ArrayList<>();
         Map<String, Double> profitRateByMarket = new LinkedHashMap<>();
+        Map<ExitReason, Integer> totalExitReasonStats = new EnumMap<>(ExitReason.class);
 
         TradingStrategy selectedStrategy = null;
         if (strategyName != null && !strategyName.isEmpty()) {
@@ -135,6 +134,12 @@ public class BacktestService {
 
                 marketResults.add(result);
                 profitRateByMarket.put(market, result.getTotalProfitRate());
+
+                // 종료 사유 통계 합산
+                if (result.getExitReasonStats() != null) {
+                    result.getExitReasonStats().forEach((reason, count) ->
+                            totalExitReasonStats.put(reason, totalExitReasonStats.getOrDefault(reason, 0) + count));
+                }
 
                 // API 속도 제한 방지
                 Thread.sleep(300);
@@ -199,6 +204,7 @@ public class BacktestService {
                 .worstMarketProfitRate(worst != null ? worst.getTotalProfitRate() : null)
                 .marketResults(marketResults)
                 .profitRateByMarket(profitRateByMarket)
+                .totalExitReasonStats(totalExitReasonStats)
                 .build();
     }
 
@@ -708,6 +714,9 @@ public class BacktestService {
 
         int minRequiredCandles = 30;
 
+        // 종료 사유 통계용 맵
+        Map<ExitReason, Integer> exitReasonStats = new EnumMap<>(ExitReason.class);
+
         // 백테스트용 포지션 객체 (전략에 전달)
         BacktestPosition position = BacktestPosition.empty();
 
@@ -726,6 +735,7 @@ public class BacktestService {
 
             // 전략의 analyzeForBacktest 호출 (실제 매매와 동일한 로직)
             int signal;
+            BacktestContext.clear(); // 호출 전 클리어
             try {
                 signal = strategy.analyzeForBacktest(market, currentCandles, position);
             } catch (Exception e) {
@@ -770,6 +780,17 @@ public class BacktestService {
             }
             // 매도 신호 (전략이 -1 반환)
             else if (signal == -1 && coinBalance > 0) {
+                // 전략에서 설정한 종료 사유 가져오기
+                ExitReason exitReason = BacktestContext.getExitReason();
+                if (exitReason == null) {
+                    // 명시되지 않은 경우 기본값 추정
+                    double profitRate = (currentPrice - lastBuyPrice) / lastBuyPrice;
+                    exitReason = profitRate > 0 ? ExitReason.TAKE_PROFIT : ExitReason.STOP_LOSS_FIXED;
+                }
+                
+                // 통계 업데이트
+                exitReasonStats.put(exitReason, exitReasonStats.getOrDefault(exitReason, 0) + 1);
+
                 double sellAmount = coinBalance * currentPrice;
                 double fee = sellAmount * TRADING_FEE;
                 double actualAmount = sellAmount - fee;
@@ -781,10 +802,6 @@ public class BacktestService {
                 double prevCoinBalance = coinBalance;
                 coinBalance = 0;
                 maxPriceAfterBuy = 0;
-
-                // 매도 이유 추정
-                double profitRate = (currentPrice - lastBuyPrice) / lastBuyPrice;
-                String sellReason = profitRate > 0 ? "익절" : "손절";
 
                 // 포지션 초기화
                 position = BacktestPosition.empty();
@@ -799,11 +816,12 @@ public class BacktestService {
                         .coinBalance(0.0)
                         .totalAsset(krwBalance)
                         .profitRate(((krwBalance - initialBalance) / initialBalance) * 100)
-                        .strategy(strategy.getStrategyName() + " (" + sellReason + " " + String.format("%.1f", profitRate * 100) + "%)")
+                        .strategy(strategy.getStrategyName())
+                        .exitReason(exitReason)
                         .build());
 
-                log.debug("[백테스트][매도] {} - 가격: {}, 수익률: {}%",
-                        currentCandle.getCandleDateTimeKst(), currentPrice, String.format("%.2f", profitRate * 100));
+                log.debug("[백테스트][매도] {} - 가격: {}, 사유: {}",
+                        currentCandle.getCandleDateTimeKst(), currentPrice, exitReason);
             }
 
             double currentTotalAsset = krwBalance + (coinBalance * currentPrice);
@@ -828,6 +846,12 @@ public class BacktestService {
         int buyCount = (int) tradeHistory.stream().filter(t -> "BUY".equals(t.getType())).count();
         int sellCount = (int) tradeHistory.stream().filter(t -> "SELL".equals(t.getType())).count();
         double winRate = (winCount + loseCount) > 0 ? ((double) winCount / (winCount + loseCount)) * 100 : 0;
+
+        // 통계 출력
+        System.out.println("\n===== Exit Reason Statistics =====");
+        exitReasonStats.forEach((reason, count) -> 
+            System.out.printf("%-17s : %d\n", reason, count));
+        System.out.println("==================================\n");
 
         log.info("[{}] {} 전략 - 수익률: {}%, 단순보유: {}%, 거래: {}회, 승률: {}%",
                 market, strategy.getStrategyName(),
@@ -857,6 +881,7 @@ public class BacktestService {
                 .winCount(winCount)
                 .loseCount(loseCount)
                 .winRate(Math.round(winRate * 10.0) / 10.0)
+                .exitReasonStats(exitReasonStats)
                 .tradeHistory(tradeHistory)
                 .build();
     }

@@ -41,6 +41,11 @@ public class BacktestPosition {
     private Double coinBalance;
 
     /**
+     * 종료 사유
+     */
+    private ExitReason exitReason;
+
+    /**
      * 빈 포지션 (미보유 상태)
      */
     public static BacktestPosition empty() {
@@ -50,6 +55,7 @@ public class BacktestPosition {
                 .highestPrice(null)
                 .targetPrice(null)
                 .coinBalance(0.0)
+                .exitReason(null)
                 .build();
     }
 

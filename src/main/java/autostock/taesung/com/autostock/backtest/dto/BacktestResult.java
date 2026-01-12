@@ -4,6 +4,7 @@ import lombok.Builder;
 import lombok.Data;
 
 import java.util.List;
+import java.util.Map;
 
 @Data
 @Builder
@@ -35,6 +36,9 @@ public class BacktestResult {
     private Integer winCount;           // 수익 거래 횟수
     private Integer loseCount;          // 손실 거래 횟수
     private Double winRate;             // 승률 (%)
+
+    // 종료 사유 통계
+    private Map<ExitReason, Integer> exitReasonStats;
 
     // 거래 내역
     private List<TradeRecord> tradeHistory;  // 거래 기록
