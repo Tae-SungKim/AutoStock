@@ -64,6 +64,13 @@ public class AutoTradingService {
     @Value("${trading.auto-select-top:0}")
     private int autoSelectTop;
 
+    // 마켓 범위 설정 (분산 서버용)
+    @Value("${trading.market-range-start:0}")
+    private int marketRangeStart;
+
+    @Value("${trading.market-range-count:100}")
+    private int marketRangeCount;
+
     @Value("${trading.investment-ratio:0.1}")
     private double investmentRatio;  // 투자 비율 (예: 0.1 = 10%)
 
@@ -126,8 +133,8 @@ public class AutoTradingService {
             return List.of();
         }
 
-        // 상위 N개 자동 선택
-        if (autoSelectTop > 0) {
+        // 상위 N개 자동 선택 (분산 서버용 범위 적용)
+        if (autoSelectTop > 0 || marketRangeCount > 0) {
             try {
                 List<Market> markets = upbitApiService.getMarkets();
                 return markets.stream()
@@ -135,7 +142,8 @@ public class AutoTradingService {
                         .filter(m -> !"CAUTION".equals(m.getMarketWarning()))
                         .map(Market::getMarket)
                         .filter(this::isMarketAllowed)
-                        .limit(autoSelectTop)
+                        .skip(marketRangeStart)
+                        .limit(marketRangeCount)
                         .collect(Collectors.toList());
             } catch (Exception e) {
                 log.error("마켓 목록 조회 실패: {}", e.getMessage());

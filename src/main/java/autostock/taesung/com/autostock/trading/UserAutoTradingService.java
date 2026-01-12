@@ -63,6 +63,13 @@ public class UserAutoTradingService {
     @Value("${trading.auto-select-top:0}")
     private int autoSelectTop;
 
+    // 마켓 범위 설정 (분산 서버용)
+    @Value("${trading.market-range-start:0}")
+    private int marketRangeStart;
+
+    @Value("${trading.market-range-count:100}")
+    private int marketRangeCount;
+
     @Value("${trading.investment-ratio:0.1}")
     private double investmentRatio;
 
@@ -82,7 +89,7 @@ public class UserAutoTradingService {
         }
 
         List<String> excludedMarkets = parseExcludedMarkets();
-        List<String> markets = getTopKrwMarkets(200, excludedMarkets);
+        List<String> markets = getTopKrwMarkets(marketRangeStart, marketRangeCount, excludedMarkets);
 
         if (markets.isEmpty()) {
             log.warn("[{}] 거래 가능한 마켓이 없습니다.", user.getUsername());
@@ -156,9 +163,12 @@ public class UserAutoTradingService {
     }
 
     /**
-     * KRW 마켓 상위 코인 목록 조회
+     * KRW 마켓 상위 코인 목록 조회 (분산 서버용 범위 적용)
+     * @param skip 건너뛸 마켓 수 (시작 인덱스)
+     * @param limit 가져올 마켓 수
+     * @param excludedMarkets 제외할 마켓 목록
      */
-    public List<String> getTopKrwMarkets(int limit, List<String> excludedMarkets) {
+    public List<String> getTopKrwMarkets(int skip, int limit, List<String> excludedMarkets) {
         try {
             List<Market> markets = upbitApiService.getMarkets();
             return markets.stream()
@@ -166,6 +176,7 @@ public class UserAutoTradingService {
                     .filter(m -> !"CAUTION".equals(m.getMarketWarning()))  // 유의 종목 제외
                     .map(Market::getMarket)
                     .filter(m -> isMarketAllowed(m, excludedMarkets))
+                    .skip(skip)
                     .limit(limit)
                     .collect(Collectors.toList());
         } catch (Exception e) {
