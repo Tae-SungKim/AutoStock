@@ -150,6 +150,46 @@ public class StrategyParameterService {
                         .minValue(10.0).maxValue(100.0).build()
         ));
 
+        // DataDrivenStrategy 파라미터
+        STRATEGY_PARAMS.put("DataDrivenStrategy", Arrays.asList(
+                ParameterDefinition.builder()
+                        .key("bollinger.period").name("볼린저 기간").description("볼린저 밴드 계산 기간")
+                        .type(StrategyParameter.ParamType.INTEGER).defaultValue("20")
+                        .minValue(5.0).maxValue(100.0).build(),
+                ParameterDefinition.builder()
+                        .key("bollinger.multiplier").name("표준편차 배수").description("볼린저 밴드 폭 계수")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("2.0")
+                        .minValue(1.0).maxValue(4.0).build(),
+                ParameterDefinition.builder()
+                        .key("rsi.period").name("RSI 기간").description("RSI 계산 기간")
+                        .type(StrategyParameter.ParamType.INTEGER).defaultValue("14")
+                        .minValue(5.0).maxValue(50.0).build(),
+                ParameterDefinition.builder()
+                        .key("rsi.oversold").name("RSI 매수").description("매수 신호 기준 RSI 값")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("30")
+                        .minValue(10.0).maxValue(50.0).build(),
+                ParameterDefinition.builder()
+                        .key("rsi.overbought").name("RSI 매도").description("매도 신호 기준 RSI 값")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("70")
+                        .minValue(50.0).maxValue(90.0).build(),
+                ParameterDefinition.builder()
+                        .key("volume.threshold").name("거래량 증가율").description("거래량 증가 기준 (%)")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("100")
+                        .minValue(50.0).maxValue(500.0).build(),
+                ParameterDefinition.builder()
+                        .key("stopLoss.rate").name("손절률").description("손절 기준 (%)")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("-2.5")
+                        .minValue(-10.0).maxValue(-0.5).build(),
+                ParameterDefinition.builder()
+                        .key("takeProfit.rate").name("익절률").description("익절 기준 (%)")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("3.0")
+                        .minValue(1.0).maxValue(20.0).build(),
+                ParameterDefinition.builder()
+                        .key("trailingStop.rate").name("트레일링 스탑").description("고점 대비 하락 매도 기준 (%)")
+                        .type(StrategyParameter.ParamType.DOUBLE).defaultValue("1.5")
+                        .minValue(0.5).maxValue(10.0).build()
+        ));
+
     }
 
     /**

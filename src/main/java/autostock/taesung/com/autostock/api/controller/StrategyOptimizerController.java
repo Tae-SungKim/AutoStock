@@ -1,5 +1,7 @@
 package autostock.taesung.com.autostock.api.controller;
 
+import autostock.taesung.com.autostock.entity.SimulationTask;
+import autostock.taesung.com.autostock.service.AsyncSimulationService;
 import autostock.taesung.com.autostock.service.StrategyOptimizerService;
 import autostock.taesung.com.autostock.service.StrategyParameterService;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
@@ -24,6 +26,7 @@ import java.util.stream.Collectors;
 public class StrategyOptimizerController {
 
     private final StrategyOptimizerService optimizerService;
+    private final AsyncSimulationService asyncSimulationService;
     private final DataDrivenStrategy dataDrivenStrategy;
     private final StrategyParameterService strategyParameterService;
     private final List<TradingStrategy> allStrategies;  // 모든 전략 주입
@@ -290,5 +293,171 @@ public class StrategyOptimizerController {
                     "message", "파라미터 설정 실패: " + e.getMessage()
             ));
         }
+    }
+
+    // ============================================================
+    // 비동기 API (장시간 작업용 - Nginx 504 방지)
+    // ============================================================
+
+    /**
+     * [비동기] 최적화 및 적용 작업 시작
+     * - 즉시 taskId 반환
+     * - 백그라운드에서 시뮬레이션 실행
+     * - GET /tasks/{taskId}로 상태 조회
+     */
+    @PostMapping("/async/optimize-and-apply")
+    public ResponseEntity<?> asyncOptimizeAndApply() {
+        log.info("[ASYNC] 최적화 및 적용 요청");
+
+        AsyncSimulationService.TaskResponse response = asyncSimulationService.createAndStartTask(
+                SimulationTask.TYPE_OPTIMIZE_AND_APPLY,
+                null,
+                null
+        );
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("success", true);
+        body.put("taskId", response.getTaskId());
+        body.put("status", response.getStatus() != null ? response.getStatus().name() : "UNKNOWN");
+        body.put("message", response.getMessage() != null ? response.getMessage() : "");
+        body.put("estimatedSeconds", response.getEstimatedSeconds() != null ? response.getEstimatedSeconds() : 0);
+        body.put("checkStatusUrl", "/api/strategy-optimizer/tasks/" + response.getTaskId());
+        body.put("getResultUrl", "/api/strategy-optimizer/result/" + response.getTaskId());
+        return ResponseEntity.accepted().body(body);
+    }
+
+    /**
+     * [비동기] 전역 최적화 작업 시작
+     */
+    @PostMapping("/async/optimize")
+    public ResponseEntity<?> asyncOptimize() {
+        log.info("[ASYNC] 전역 최적화 요청");
+
+        AsyncSimulationService.TaskResponse response = asyncSimulationService.createAndStartTask(
+                SimulationTask.TYPE_GLOBAL_OPTIMIZE,
+                null,
+                null
+        );
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("success", true);
+        body.put("taskId", response.getTaskId());
+        body.put("status", response.getStatus() != null ? response.getStatus().name() : "UNKNOWN");
+        body.put("message", response.getMessage() != null ? response.getMessage() : "");
+        body.put("estimatedSeconds", response.getEstimatedSeconds() != null ? response.getEstimatedSeconds() : 0);
+        body.put("checkStatusUrl", "/api/strategy-optimizer/tasks/" + response.getTaskId());
+        return ResponseEntity.accepted().body(body);
+    }
+
+    /**
+     * [비동기] 마켓별 최적화 작업 시작
+     */
+    @PostMapping("/async/optimize/{market}")
+    public ResponseEntity<?> asyncOptimizeForMarket(@PathVariable String market) {
+        log.info("[ASYNC] 마켓별 최적화 요청: {}", market);
+
+        AsyncSimulationService.TaskResponse response = asyncSimulationService.createAndStartTask(
+                SimulationTask.TYPE_MARKET_OPTIMIZE,
+                market.toUpperCase(),
+                null
+        );
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("success", true);
+        body.put("taskId", response.getTaskId());
+        body.put("status", response.getStatus() != null ? response.getStatus().name() : "UNKNOWN");
+        body.put("message", response.getMessage() != null ? response.getMessage() : "");
+        body.put("targetMarket", market);
+        body.put("estimatedSeconds", response.getEstimatedSeconds() != null ? response.getEstimatedSeconds() : 0);
+        body.put("checkStatusUrl", "/api/strategy-optimizer/tasks/" + response.getTaskId());
+        return ResponseEntity.accepted().body(body);
+    }
+
+    /**
+     * 작업 상태 조회
+     */
+    @GetMapping("/tasks/{taskId}")
+    public ResponseEntity<?> getTaskStatus(@PathVariable String taskId) {
+        AsyncSimulationService.TaskResponse response = asyncSimulationService.getTaskStatus(taskId);
+
+        if (response.getStatus() == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("success", true);
+        body.put("taskId", response.getTaskId());
+        body.put("status", response.getStatus());
+        body.put("message", response.getMessage());
+        body.put("progress", response.getProgress() != null ? response.getProgress() : 0);
+        body.put("currentStep", response.getCurrentStep() != null ? response.getCurrentStep() : "");
+        body.put("createdAt", response.getCreatedAt() != null ? response.getCreatedAt().toString() : "");
+        body.put("startedAt", response.getStartedAt() != null ? response.getStartedAt().toString() : "");
+        body.put("completedAt", response.getCompletedAt() != null ? response.getCompletedAt().toString() : "");
+        body.put("estimatedSeconds", response.getEstimatedSeconds() != null ? response.getEstimatedSeconds() : 0);
+        body.put("elapsedSeconds", response.getElapsedSeconds() != null ? response.getElapsedSeconds() : 0);
+        body.put("errorMessage", response.getErrorMessage() != null ? response.getErrorMessage() : "");
+
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * 작업 결과 조회 (완료된 작업만)
+     */
+    @GetMapping("/result/{taskId}")
+    public ResponseEntity<?> getTaskResult(@PathVariable String taskId) {
+        AsyncSimulationService.TaskResponse response = asyncSimulationService.getTaskResult(taskId);
+
+        if (response.getStatus() == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("success", true);
+        result.put("taskId", response.getTaskId());
+        result.put("status", response.getStatus());
+        result.put("message", response.getMessage());
+        result.put("elapsedSeconds", response.getElapsedSeconds());
+
+        if (response.getResult() != null) {
+            result.put("result", response.getResult());
+        }
+
+        if (response.getErrorMessage() != null) {
+            result.put("errorMessage", response.getErrorMessage());
+        }
+
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * 작업 취소 요청
+     */
+    @PostMapping("/tasks/{taskId}/cancel")
+    public ResponseEntity<?> cancelTask(@PathVariable String taskId) {
+        log.info("작업 취소 요청: {}", taskId);
+
+        AsyncSimulationService.TaskResponse response = asyncSimulationService.cancelTask(taskId);
+
+        return ResponseEntity.ok(Map.of(
+                "success", true,
+                "taskId", response.getTaskId(),
+                "status", response.getStatus() != null ? response.getStatus() : "NOT_FOUND",
+                "message", response.getMessage()
+        ));
+    }
+
+    /**
+     * 최근 작업 목록 조회
+     */
+    @GetMapping("/tasks")
+    public ResponseEntity<?> getRecentTasks() {
+        List<AsyncSimulationService.TaskResponse> tasks = asyncSimulationService.getRecentTasks();
+
+        return ResponseEntity.ok(Map.of(
+                "success", true,
+                "count", tasks.size(),
+                "tasks", tasks
+        ));
     }
 }

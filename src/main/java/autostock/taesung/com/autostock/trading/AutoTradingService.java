@@ -11,10 +11,12 @@ import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Market;
 import autostock.taesung.com.autostock.exchange.upbit.dto.OrderResponse;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Ticker;
+import autostock.taesung.com.autostock.realtrading.config.RealTradingConfig;
 import autostock.taesung.com.autostock.repository.CandleDataRepository;
 import autostock.taesung.com.autostock.repository.TickerDataRepository;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
+import autostock.taesung.com.autostock.strategy.impl.ScaledTradingStrategy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -84,8 +86,15 @@ public class AutoTradingService {
     @Value("${trading.stop-loss-enabled:true}")
     private boolean stopLossEnabled; // 손절 활성화 여부
 
+    // 전략 모드 설정 (DEFAULT: 다수결, SCALED_TRADING: 분할매매)
+    @Value("${trading.strategy-mode:DEFAULT}")
+    private String strategyMode;
+
     private final int minuteInterval = 1;
     private final int candleCount = 200;
+
+    // 분할매매 전략 (주입)
+    private final RealTradingConfig realTradingConfig;
 
     private List<String> targetMarkets = new ArrayList<>();
     private List<String> excludedMarkets = new ArrayList<>();
@@ -302,22 +311,17 @@ public class AutoTradingService {
             return;
         }
 
-        log.info("----- [{}] 분석 시작 -----", market);
+        log.info("----- [{}] 분석 시작 (모드: {}) -----", market, strategyMode);
 
         try {
             // DB에 데이터가 충분한지 확인하여 API 호출 갯수 조절
             int fetchCount = candleCount;
             Optional<CandleData> lastCandle = candleDataRepository.findFirstByMarketAndUnitOrderByCandleDateTimeKstDesc(market, minuteInterval);
-            
+
             if (lastCandle.isEmpty()) {
-                // 데이터가 전혀 없으면 200개 가져옴
                 fetchCount = candleCount;
             } else {
-                // 이미 데이터가 있다면 최근 1~2개만 가져와서 업데이트해도 됨
-                // 하지만 전략 분석 로직이 List<Candle>을 200개 기대하므로,
-                // 분석용으로는 200개를 유지하되 DB 저장 로직에서 중복을 효율적으로 스킵함
-                // (만약 API 호출 자체를 줄이고 싶다면 분석 로직을 DB 기반으로 바꿔야 함)
-                fetchCount = candleCount; 
+                fetchCount = candleCount;
             }
 
             // 1. 캔들 데이터 조회
@@ -343,52 +347,211 @@ public class AutoTradingService {
             // 현재가 DB 저장
             saveTickerToDb(ticker);
 
-            // 3. 전략 분석 (다수결)
-            int buySignals = 0;
-            int sellSignals = 0;
-            List<String> buyStrategies = new ArrayList<>();
-            List<String> sellStrategies = new ArrayList<>();
-            Double targetPrice = null;  // 목표 판매가
-
-            for (TradingStrategy strategy : strategies) {
-                try {
-                    int signal = strategy.analyze(market, candles);
-                    if (signal == 1) {
-                        buySignals++;
-                        buyStrategies.add(strategy.getStrategyName());
-                        // 목표가가 있는 전략에서 목표가 수집 (볼린저밴드 등)
-                        Double strategyTarget = strategy.getTargetPrice(market);
-                        if (strategyTarget != null && targetPrice == null) {
-                            targetPrice = strategyTarget;
-                        }
-                    } else if (signal == -1) {
-                        sellSignals++;
-                        sellStrategies.add(strategy.getStrategyName());
-                    }
-                } catch (Exception e) {
-                    // 분석 실패 무시
-                }
-            }
-
-            log.info("[{}] 전략 분석 - 매수: {}/{}, 매도: {}/{}",
-                    market, buySignals, strategies.size(), sellSignals, strategies.size());
-
-            // 4. 매매 실행 (과반수 이상 동의 시)
-            int threshold = (strategies.size() / 2) + 1;
-
-            if (buySignals >= threshold) {
-                log.info("[{}] 매수 신호! 동의 전략: {}, 목표가: {}", market, buyStrategies,
-                        targetPrice != null ? String.format("%.0f", targetPrice) : "없음");
-                executeBuyForMarket(user, market, currentPrice, String.join(", ", buyStrategies), targetPrice);
-            } else if (sellSignals >= threshold) {
-                log.info("[{}] 매도 신호! 동의 전략: {}", market, sellStrategies);
-                executeSellForMarket(user, market, currentPrice, String.join(", ", sellStrategies));
+            // 전략 모드에 따라 분기
+            if ("SCALED_TRADING".equalsIgnoreCase(strategyMode)) {
+                executeScaledTradingForMarket(user, market, candles, currentPrice);
             } else {
-                log.info("[{}] 관망 - 매매 조건 미충족", market);
+                executeDefaultTradingForMarket(user, market, candles, currentPrice);
             }
 
         } catch (Exception e) {
             log.error("[{}] 분석 중 오류: {}", market, e.getMessage());
+        }
+    }
+
+    /**
+     * 기본 매매 모드 (다수결 전략)
+     */
+    private void executeDefaultTradingForMarket(User user, String market, List<Candle> candles, double currentPrice) {
+        int buySignals = 0;
+        int sellSignals = 0;
+        List<String> buyStrategies = new ArrayList<>();
+        List<String> sellStrategies = new ArrayList<>();
+        Double targetPrice = null;
+
+        for (TradingStrategy strategy : strategies) {
+            try {
+                int signal = strategy.analyze(market, candles);
+                if (signal == 1) {
+                    buySignals++;
+                    buyStrategies.add(strategy.getStrategyName());
+                    Double strategyTarget = strategy.getTargetPrice(market);
+                    if (strategyTarget != null && targetPrice == null) {
+                        targetPrice = strategyTarget;
+                    }
+                } else if (signal == -1) {
+                    sellSignals++;
+                    sellStrategies.add(strategy.getStrategyName());
+                }
+            } catch (Exception e) {
+                // 분석 실패 무시
+            }
+        }
+
+        log.info("[{}] 전략 분석 - 매수: {}/{}, 매도: {}/{}",
+                market, buySignals, strategies.size(), sellSignals, strategies.size());
+
+        int threshold = (strategies.size() / 2) + 1;
+
+        if (buySignals >= threshold) {
+            log.info("[{}] 매수 신호! 동의 전략: {}, 목표가: {}", market, buyStrategies,
+                    targetPrice != null ? String.format("%.0f", targetPrice) : "없음");
+            executeBuyForMarket(user, market, currentPrice, String.join(", ", buyStrategies), targetPrice);
+        } else if (sellSignals >= threshold) {
+            log.info("[{}] 매도 신호! 동의 전략: {}", market, sellStrategies);
+            executeSellForMarket(user, market, currentPrice, String.join(", ", sellStrategies));
+        } else {
+            log.info("[{}] 관망 - 매매 조건 미충족", market);
+        }
+    }
+
+    /**
+     * 분할매매 모드 (ScaledTradingStrategy)
+     * - 3단계 분할 진입 (30%/30%/40%)
+     * - 50% 부분 익절 + 트레일링 스탑
+     */
+    private void executeScaledTradingForMarket(User user, String market, List<Candle> candles, double currentPrice) {
+        // ScaledTradingStrategy 찾기
+        ScaledTradingStrategy scaledStrategy = null;
+        for (TradingStrategy strategy : strategies) {
+            if (strategy instanceof ScaledTradingStrategy) {
+                scaledStrategy = (ScaledTradingStrategy) strategy;
+                break;
+            }
+        }
+
+        if (scaledStrategy == null) {
+            log.warn("[{}] ScaledTradingStrategy를 찾을 수 없습니다. DEFAULT 모드로 전환", market);
+            executeDefaultTradingForMarket(user, market, candles, currentPrice);
+            return;
+        }
+
+        // 전략 분석
+        int signal = scaledStrategy.analyze(market, candles);
+        Double targetPrice = scaledStrategy.getTargetPrice(market);
+        Double stopLossPrice = scaledStrategy.getStopLossPrice(market);
+        int entryPhase = scaledStrategy.getEntryPhase(market);
+
+        log.info("[{}] 분할매매 분석 - 신호: {}, 진입단계: {}, 목표가: {}, 손절가: {}",
+                market, signal, entryPhase,
+                targetPrice != null ? String.format("%.0f", targetPrice) : "없음",
+                stopLossPrice != null ? String.format("%.0f", stopLossPrice) : "없음");
+
+        if (signal == 1) {
+            // 매수 신호 (신규 진입 또는 추가 진입)
+            String reason = scaledStrategy.getEntryPhase(market) > 0
+                    ? "ScaledTrading_추가진입_" + entryPhase + "차"
+                    : "ScaledTrading_신규진입";
+            log.info("[{}] 📈 분할매매 매수 신호! 사유: {}", market, reason);
+            executeBuyForMarketWithRatio(user, market, currentPrice, reason, targetPrice, entryPhase);
+
+        } else if (signal == -1) {
+            // 매도 신호 (손절/익절/트레일링)
+            String exitReason = scaledStrategy.getExitReason(market);
+            double exitRatio = scaledStrategy.getPartialExitRatio(market);
+
+            log.info("[{}] 📉 분할매매 매도 신호! 사유: {}, 청산비율: {}%",
+                    market, exitReason, String.format("%.0f", exitRatio * 100));
+
+            if (exitRatio < 1.0 && !scaledStrategy.isPartialExitDone(market)) {
+                // 부분 청산 (1차 익절: 50%)
+                executeSellForMarketWithRatio(user, market, currentPrice,
+                        "ScaledTrading_" + exitReason, exitRatio);
+            } else {
+                // 전체 청산 (손절/트레일링)
+                executeSellForMarket(user, market, currentPrice, "ScaledTrading_" + exitReason);
+            }
+
+            // 포지션 상태 정리
+            scaledStrategy.clearPosition(market);
+
+        } else {
+            log.info("[{}] 관망 - 분할매매 조건 미충족", market);
+        }
+    }
+
+    /**
+     * 분할 진입 비율에 따른 매수 실행
+     */
+    private void executeBuyForMarketWithRatio(User user, String market, double currentPrice,
+                                               String strategyName, Double targetPrice, int entryPhase) {
+        if (!isMarketAllowed(market)) {
+            log.warn("[{}] 제외된 마켓입니다. 매수 취소.", market);
+            return;
+        }
+
+        try {
+            double krwBalance = upbitApiService.getKrwBalance(user);
+
+            // 분할 진입 비율 계산
+            double entryRatio = realTradingConfig.getEntryRatio(Math.max(1, entryPhase));
+            double positionRatio = realTradingConfig.getMaxPositionSizeRate();
+
+            // 최대 포지션 크기의 N% (진입 단계별)
+            double orderAmount = krwBalance * positionRatio * entryRatio;
+
+            log.info("[{}] 분할매수 - {}차 진입, KRW 잔고: {}, 진입비율: {}%, 주문금액: {}",
+                    market, entryPhase,
+                    String.format("%.0f", krwBalance),
+                    String.format("%.0f", entryRatio * 100),
+                    String.format("%.0f", orderAmount));
+
+            if (orderAmount < minOrderAmount) {
+                log.warn("[{}] 주문 금액이 최소 주문 금액({})보다 작습니다.", market, minOrderAmount);
+                orderAmount = minOrderAmount;
+            }
+
+            OrderResponse order = upbitApiService.buyMarketOrder(user, market, orderAmount);
+            log.info("[{}] 분할매수 주문 완료! UUID: {}, {}차 진입", market, order.getUuid(), entryPhase);
+
+            saveTradeHistory(market, TradeType.BUY, orderAmount, currentPrice, order.getUuid(),
+                    strategyName + "_" + entryPhase + "차", targetPrice);
+
+        } catch (Exception e) {
+            log.error("[{}] 분할매수 실행 실패: {}", market, e.getMessage());
+        }
+    }
+
+    /**
+     * 부분 청산 매도 실행 (비율 지정)
+     */
+    private void executeSellForMarketWithRatio(User user, String market, double currentPrice,
+                                                String strategyName, double sellRatio) {
+        if (!isMarketAllowed(market)) {
+            log.warn("[{}] 제외된 마켓입니다. 매도 취소.", market);
+            return;
+        }
+
+        try {
+            String currency = market.split("-")[1];
+            double coinBalance = upbitApiService.getCoinBalance(user, currency);
+
+            log.info("[{}] {} 보유량: {}", market, currency, coinBalance);
+
+            if (coinBalance <= 0) {
+                log.warn("[{}] 매도할 코인이 없습니다.", market);
+                return;
+            }
+
+            // 부분 청산 수량 계산
+            double sellAmount = coinBalance * sellRatio;
+
+            // 최소 주문 금액 체크
+            if (sellAmount * currentPrice < 5000) {
+                log.warn("[{}] 부분 청산 금액이 최소 주문 금액 미만. 전체 청산으로 전환.", market);
+                sellAmount = coinBalance;
+            }
+
+            OrderResponse order = upbitApiService.sellMarketOrder(user, market, sellAmount);
+            log.info("[{}] 부분 매도 주문 완료! UUID: {}, 청산비율: {}%, 수량: {}",
+                    market, order.getUuid(), String.format("%.0f", sellRatio * 100), sellAmount);
+
+            double sellValue = sellAmount * currentPrice;
+            saveTradeHistory(market, TradeType.SELL, sellValue, currentPrice, order.getUuid(),
+                    strategyName + "_부분청산", null);
+
+        } catch (Exception e) {
+            log.error("[{}] 부분 매도 실행 실패: {}", market, e.getMessage());
         }
     }
 
