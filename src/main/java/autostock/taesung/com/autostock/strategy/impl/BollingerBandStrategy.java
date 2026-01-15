@@ -3,7 +3,9 @@ package autostock.taesung.com.autostock.strategy.impl;
 import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
 import autostock.taesung.com.autostock.backtest.dto.ExitReason;
 import autostock.taesung.com.autostock.entity.TradeHistory;
+import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
+import autostock.taesung.com.autostock.exchange.upbit.dto.Orderbook;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
 import autostock.taesung.com.autostock.strategy.TechnicalIndicator;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
@@ -18,24 +20,64 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * 볼린저밴드 전략
+ *
+ * ===== GCP 저사양 환경 최적화 =====
+ * - 1분 스케줄러 전용
+ * - 호가창은 진입 시에만 체크 (API 호출 최소화)
+ * - 각 서버별 마켓 분리로 동기화 불필요
+ * - GCP 서버 2대, 각 100개 마켓 분리 운영
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class BollingerBandStrategy implements TradingStrategy {
 
+    /* =====================================================
+     * 기본 상수 (1분봉 기준)
+     * ===================================================== */
     private static final int PERIOD = 20;
     private static final double STD_DEV_MULTIPLIER = 2.0;
 
+    // 3분봉 권장: STOP_LOSS_COOLDOWN_CANDLES = 3 (현재 1분봉: 5)
     private static final int STOP_LOSS_COOLDOWN_CANDLES = 5;
+    // 3분봉 권장: MIN_HOLD_CANDLES = 2 (현재 1분봉: 3)
     private static final int MIN_HOLD_CANDLES = 3;
 
+    // 3분봉 권장: STOP_LOSS_ATR_MULT = 2.5 (현재 1분봉: 2.0)
     private static final double STOP_LOSS_ATR_MULT = 2.0;
+    // 3분봉 권장: TAKE_PROFIT_ATR_MULT = 3.0 (현재 1분봉: 2.5)
     private static final double TAKE_PROFIT_ATR_MULT = 2.5;
     private static final double TRAILING_STOP_ATR_MULT = 1.5;
 
+    /* =====================================================
+     * [1] 슬리피지 및 수수료 상수
+     * ===================================================== */
+    private static final double SLIPPAGE_RATE = 0.0015;    // 0.15% 슬리피지
+    private static final double FEE_RATE = 0.0005;         // 0.05% 수수료
+    private static final double TOTAL_COST = 0.002;        // 0.2% 총 비용
+    private static final double MIN_PROFIT_RATE = 0.006;   // 0.6% 최소 수익률 (비용의 3배)
+
+    /* =====================================================
+     * 호가창 검증 상수
+     * ===================================================== */
+    private static final double MAX_SPREAD_RATE = 0.003;       // 최대 스프레드 0.3%
+    private static final double MIN_BID_IMBALANCE = 0.55;      // 최소 매수세 55%
+    private static final double MAX_PRICE_DIFF_RATE = 0.005;   // 최대 가격 괴리 0.5%
+
+    /* =====================================================
+     * ATR 손절 최대값 제한
+     * ===================================================== */
+    private static final double MAX_STOP_LOSS_RATE = 0.03;     // 최대 손절 -3%
+
+    /* =====================================================
+     * [2] 의존성 주입 (@RequiredArgsConstructor)
+     * ===================================================== */
     private final TechnicalIndicator indicator;
     private final TradeHistoryRepository tradeHistoryRepository;
     private final StrategyParameterService strategyParameterService;
+    private final UpbitApiService upbitApiService;
 
     private Double targetPrice = null;
 
@@ -53,6 +95,7 @@ public class BollingerBandStrategy implements TradingStrategy {
         double multiplier = strategyParameterService.getDoubleParam(getStrategyName(), null, "bollinger.multiplier", STD_DEV_MULTIPLIER);
         double stopLossRate = strategyParameterService.getDoubleParam(getStrategyName(), null, "stopLoss.rate", -2.5);
         double takeProfitRate = strategyParameterService.getDoubleParam(getStrategyName(), null, "takeProfit.rate", 2.0);
+        // 3분봉 권장: volumeThreshold = 100.0 (현재 1분봉: 120.0)
         double volumeThreshold = strategyParameterService.getDoubleParam(getStrategyName(), null, "volume.threshold", 120.0);
         double rsiOversold = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.oversold", 30.0);
         double rsiOverbought = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.overbought", 70.0);
@@ -86,6 +129,7 @@ public class BollingerBandStrategy implements TradingStrategy {
 
         /* =====================================================
          * 1️⃣ 매도 로직 (보유 중)
+         * [6] 손익 계산 시 비용 반영
          * ===================================================== */
         if (holding) {
             double buyPrice = latest.getPrice().doubleValue();
@@ -99,10 +143,20 @@ public class BollingerBandStrategy implements TradingStrategy {
                 highest = currentPrice;
             }
 
+            // [6] 실제 매수가 반영 (슬리피지 + 수수료)
+            double realBuyPrice = buyPrice * (1 + TOTAL_COST);
+            // [6] 실제 매도가 반영
+            double realSellPrice = currentPrice * (1 - TOTAL_COST);
+            // 실제 수익률 계산
+            double realProfitRate = (realSellPrice - realBuyPrice) / realBuyPrice;
+
+            // [7] ATR 손절 최대값 제한 (-3%)
+            double maxStopLoss = buyPrice * (1 - MAX_STOP_LOSS_RATE);
             double fixedStopLoss = buyPrice * (1 + stopLossRate / 100);
             double atrStopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
-            double stopLoss = Math.max(fixedStopLoss, atrStopLoss);
+            double stopLoss = Math.max(maxStopLoss, Math.max(fixedStopLoss, atrStopLoss));
 
+            // 익절 조건
             double fixedTakeProfit = buyPrice * (1 + takeProfitRate / 100);
             double atrTakeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
             double takeProfit = Math.min(fixedTakeProfit, atrTakeProfit);
@@ -113,20 +167,38 @@ public class BollingerBandStrategy implements TradingStrategy {
                     .between(latest.getCreatedAt(), java.time.LocalDateTime.now())
                     .toMinutes();
 
+            // [8] 손절 로깅 개선
             if (holdingMinutes >= MIN_HOLD_CANDLES && currentPrice <= stopLoss) {
-                log.info("[{}] 손절", market);
+                log.info("[{}] 손절 - BuyPrice: {}, CurrentPrice: {}, Loss: {}%",
+                        market, String.format("%.0f", buyPrice),
+                        String.format("%.0f", currentPrice),
+                        String.format("%.2f", realProfitRate * 100));
                 return -1;
             }
 
+            // [6] 익절 시 최소 수익률 체크 (0.6% 이상만 익절)
             if (currentPrice >= takeProfit && rsi > rsiOverbought) {
-                log.info("[{}] 익절", market);
-                return -1;
+                if (realProfitRate >= MIN_PROFIT_RATE) {
+                    log.info("[{}] 익절 - BuyPrice: {}, CurrentPrice: {}, RealProfit: {}%",
+                            market, String.format("%.0f", buyPrice),
+                            String.format("%.0f", currentPrice),
+                            String.format("%.2f", realProfitRate * 100));
+                    return -1;
+                } else {
+                    log.debug("[{}] 익절 조건 충족했으나 최소수익률(0.6%) 미달: {}%",
+                            market, String.format("%.2f", realProfitRate * 100));
+                }
             }
 
+            // [8] 트레일링 로깅 개선
             if (holdingMinutes >= MIN_HOLD_CANDLES &&
                     currentPrice <= trailingStop &&
                     highest > buyPrice * 1.01) {
-                log.info("[{}] 트레일링 종료", market);
+                log.info("[{}] 트레일링 종료 - BuyPrice: {}, Highest: {}, CurrentPrice: {}, Profit: {}%",
+                        market, String.format("%.0f", buyPrice),
+                        String.format("%.0f", highest),
+                        String.format("%.0f", currentPrice),
+                        String.format("%.2f", realProfitRate * 100));
                 return -1;
             }
 
@@ -146,11 +218,8 @@ public class BollingerBandStrategy implements TradingStrategy {
         /* =====================================================
          * 3️⃣ 1분봉 생존 필터
          * ===================================================== */
-
         if (bandWidthPercent < 0.8) return 0;
-
         if (!isHigherLowStructure(candles)) return 0;
-
         if (isFakeRebound(candles)) return 0;
 
         double candleMove = Math.abs(
@@ -158,13 +227,34 @@ public class BollingerBandStrategy implements TradingStrategy {
                         - candles.get(1).getTradePrice().doubleValue()
         );
         if (candleMove > atr * 0.8) return 0;
-
         if (currentVolume < avgVolume * 0.9) return 0;
-
         if (rsi > rsiOverbought) return 0;
 
         /* =====================================================
-         * 4️⃣ 진입 시그널
+         * 4️⃣ 진입 조건 강화 - 추세 확인
+         * ===================================================== */
+        double avgPrice10 = candles.subList(0, 10).stream()
+                .mapToDouble(c -> c.getTradePrice().doubleValue())
+                .average().orElse(currentPrice);
+        if (currentPrice <= avgPrice10 * 0.998) {
+            log.debug("[{}] 하락 추세 감지 - 진입 차단", market);
+            return 0;
+        }
+
+        /* =====================================================
+         * 4️⃣ 진입 조건 강화 - 거래량 지속성 체크
+         * ===================================================== */
+        double minSustainedVolume = avgVolume * 0.8;
+        for (int i = 0; i < 3; i++) {
+            double candleVolume = candles.get(i).getCandleAccTradePrice().doubleValue();
+            if (candleVolume < minSustainedVolume) {
+                log.debug("[{}] 거래량 지속성 부족 - 진입 차단", market);
+                return 0;
+            }
+        }
+
+        /* =====================================================
+         * 5️⃣ 진입 시그널
          * ===================================================== */
         boolean stochEntry =
                 stochK > stochD &&
@@ -178,7 +268,7 @@ public class BollingerBandStrategy implements TradingStrategy {
                         currentPrice > middleBand;
 
         /* =====================================================
-         * 5️⃣ 거래대금 필터
+         * 6️⃣ 거래대금 필터
          * ===================================================== */
         double minTradeAmount = getMinTradeAmountByTime();
         double avgTradeAmount = candles.subList(1, 4).stream()
@@ -188,16 +278,138 @@ public class BollingerBandStrategy implements TradingStrategy {
         if (avgTradeAmount < minTradeAmount * 0.7) return 0;
 
         /* =====================================================
-         * 6️⃣ 매수
+         * 7️⃣ [4] 매수 신호 + 호가창 최종 검증
          * ===================================================== */
         if (stochEntry || volumeBreakout) {
+            // [3] 호가창 최종 검증 (진입 시에만 호출 - API 부담 최소화)
+            if (!validateOrderbookForEntry(market, currentPrice)) {
+                targetPrice = null;
+                return 0;  // 검증 실패 시 진입 포기
+            }
+
             this.targetPrice = currentPrice + atr * 1.5;
-            log.info("[{}] 매수 진입", market);
+            // [8] 매수 진입 로깅 개선
+            log.info("[{}] 매수 진입 - Price: {}, RSI: {}, ATR: {}",
+                    market, String.format("%.0f", currentPrice),
+                    String.format("%.1f", rsi),
+                    String.format("%.2f", atr));
             return 1;
         }
 
         targetPrice = null;
         return 0;
+    }
+
+    /* =====================================================
+     * [3] 호가창 검증 메서드 (진입 시에만 호출)
+     * - 1분에 최대 1~2회만 호출 (API 부담 최소)
+     * - 검증 실패 시 진입 포기
+     * ===================================================== */
+    /**
+     * 매수 진입 직전 호가창 최종 검증
+     * @param market 마켓 코드
+     * @param currentPrice 현재가
+     * @return 검증 통과 여부
+     */
+    private boolean validateOrderbookForEntry(String market, double currentPrice) {
+        try {
+            Orderbook ob = upbitApiService.getOrderbook(market);
+            if (ob == null) {
+                log.warn("[{}] 호가창 조회 실패", market);
+                return false;
+            }
+
+            // ✅ 1. 스프레드 체크 (0.3% 이하만 진입)
+            double askPrice = ob.getAskPrice(0);
+            double bidPrice = ob.getBidPrice(0);
+            double spread = (askPrice - bidPrice) / bidPrice;
+
+            if (spread > MAX_SPREAD_RATE) {
+                log.info("[{}] 스프레드 과다: {}% > 0.3%",
+                        market, String.format("%.2f", spread * 100));
+                return false;
+            }
+
+            // ✅ 2. 호가 불균형 체크 (매수세 55% 이상)
+            double bidVol0 = ob.getBidSize(0);
+            double bidVol1 = ob.getBidSize(1);
+            double bidVol2 = ob.getBidSize(2);
+            double askVol0 = ob.getAskSize(0);
+            double askVol1 = ob.getAskSize(1);
+            double askVol2 = ob.getAskSize(2);
+
+            double totalBid = bidVol0 + bidVol1 + bidVol2;
+            double totalAsk = askVol0 + askVol1 + askVol2;
+            double imbalance = totalBid / (totalBid + totalAsk);
+
+            if (imbalance < MIN_BID_IMBALANCE) {
+                log.info("[{}] 매수세 부족: {}% < 55%",
+                        market, String.format("%.1f", imbalance * 100));
+                return false;
+            }
+
+            // ✅ 3. 급격한 가격 괴리 체크
+            double priceDiff = Math.abs(currentPrice - bidPrice) / currentPrice;
+            if (priceDiff > MAX_PRICE_DIFF_RATE) {
+                log.warn("[{}] 가격 괴리 과다: {}%",
+                        market, String.format("%.2f", priceDiff * 100));
+                return false;
+            }
+
+            log.info("[{}] 호가창 검증 통과 - Spread: {}%, Imbalance: {}%",
+                    market, String.format("%.2f", spread * 100),
+                    String.format("%.1f", imbalance * 100));
+            return true;
+
+        } catch (Exception e) {
+            // [9] 에러 처리 - 오류 시 안전하게 진입 포기
+            log.error("[{}] 호가창 검증 오류: {}", market, e.getMessage());
+            return false;
+        }
+    }
+
+    /* =====================================================
+     * [5] 지정가 주문 가격 계산 메서드
+     * ===================================================== */
+    /**
+     * 지정가 매수 가격 계산
+     * - 최우선 매수호가 + 1틱 (0.01%)
+     * - 슬리피지 최소화
+     */
+    public double calculateLimitBuyPrice(String market) {
+        try {
+            Orderbook ob = upbitApiService.getOrderbook(market);
+            if (ob == null) return 0;
+
+            double bidPrice = ob.getBidPrice(0);
+            double tickSize = bidPrice * 0.0001;  // 0.01% = 1틱
+
+            return bidPrice + tickSize;
+
+        } catch (Exception e) {
+            log.error("[{}] 지정가 매수가격 계산 실패: {}", market, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * 지정가 매도 가격 계산
+     * - 최우선 매도호가 - 1틱 (0.01%)
+     */
+    public double calculateLimitSellPrice(String market) {
+        try {
+            Orderbook ob = upbitApiService.getOrderbook(market);
+            if (ob == null) return 0;
+
+            double askPrice = ob.getAskPrice(0);
+            double tickSize = askPrice * 0.0001;
+
+            return askPrice - tickSize;
+
+        } catch (Exception e) {
+            log.error("[{}] 지정가 매도가격 계산 실패: {}", market, e.getMessage());
+            return 0;
+        }
     }
 
     /* ================== 보조 메서드 ================== */
@@ -268,6 +480,11 @@ public class BollingerBandStrategy implements TradingStrategy {
         return 100_000_000;
     }
 
+    /* =====================================================
+     * [9] 백테스트 메서드
+     * - 슬리피지, 최소수익률, ATR제한 동일 적용
+     * - 호가창 검증은 제외 (과거 데이터 없음)
+     * ===================================================== */
     @Override
     public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
         if (candles.size() < 30) return 0;
@@ -304,23 +521,38 @@ public class BollingerBandStrategy implements TradingStrategy {
             double buyPrice = position.getBuyPrice();
             double highest = position.getHighestPrice();
 
+            // [6] 실제 체결가 반영 (슬리피지 + 수수료)
+            double realBuyPrice = buyPrice * (1 + TOTAL_COST);
+            double realSellPrice = currentPrice * (1 - TOTAL_COST);
+            double realProfitRate = (realSellPrice - realBuyPrice) / realBuyPrice;
+
+            // [7] ATR 손절 최대값 제한 (-3%)
+            double maxStopLoss = buyPrice * (1 - MAX_STOP_LOSS_RATE);
             double fixedStopLoss = buyPrice * (1 + stopLossRate / 100);
             double atrStopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
-            
+
             // 손절 사유 세분화
-            if (currentPrice <= atrStopLoss) {
+            if (currentPrice <= atrStopLoss && atrStopLoss >= maxStopLoss) {
                 return exit(ExitReason.STOP_LOSS_ATR);
             }
-            if (currentPrice <= fixedStopLoss) {
+            if (currentPrice <= fixedStopLoss && fixedStopLoss >= maxStopLoss) {
                 return exit(ExitReason.STOP_LOSS_FIXED);
             }
+            if (currentPrice <= maxStopLoss) {
+                return exit(ExitReason.STOP_LOSS_FIXED);  // 최대 손절 도달
+            }
 
+            // 익절 조건
             double fixedTakeProfit = buyPrice * (1 + takeProfitRate / 100);
             double atrTakeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
             double takeProfit = Math.min(fixedTakeProfit, atrTakeProfit);
 
+            // [6] 익절 시 최소 수익률 체크 (0.6% 이상만 익절)
             if (currentPrice >= takeProfit && rsi > rsiOverbought) {
-                return exit(ExitReason.TAKE_PROFIT);
+                if (realProfitRate >= MIN_PROFIT_RATE) {
+                    return exit(ExitReason.TAKE_PROFIT);
+                }
+                // 최소 수익률 미달 시 익절하지 않음
             }
 
             double trailingStop = highest - atr * TRAILING_STOP_ATR_MULT;
@@ -328,11 +560,11 @@ public class BollingerBandStrategy implements TradingStrategy {
                 return exit(ExitReason.TRAILING_STOP);
             }
 
-            // 추가 사유 예시
+            // 추가 청산 조건
             if (currentVolume < avgVolume * 0.5) {
                 return exit(ExitReason.VOLUME_DROP);
             }
-            
+
             if (rsi > 85) {
                 return exit(ExitReason.OVERHEATED);
             }
@@ -340,8 +572,63 @@ public class BollingerBandStrategy implements TradingStrategy {
             return 0;
         }
 
-        // 진입 로직은 analyze와 동일하게 유지하되 리턴값만 반환
-        return analyze(market, candles);
+        // 진입 로직
+        // 백테스트는 호가창 데이터 없어 검증 생략
+        double bandWidthPercent = ((bands[1] - bands[2]) / middleBand) * 100;
+        if (bandWidthPercent < 0.8) return 0;
+
+        if (!isHigherLowStructure(candles)) return 0;
+        if (isFakeRebound(candles)) return 0;
+
+        double candleMove = Math.abs(
+                candles.get(0).getTradePrice().doubleValue()
+                        - candles.get(1).getTradePrice().doubleValue()
+        );
+        if (candleMove > atr * 0.8) return 0;
+
+        if (currentVolume < avgVolume * 0.9) return 0;
+        if (rsi > rsiOverbought) return 0;
+
+        // 추세 확인
+        double avgPrice10 = candles.subList(0, 10).stream()
+                .mapToDouble(c -> c.getTradePrice().doubleValue())
+                .average().orElse(currentPrice);
+        if (currentPrice <= avgPrice10 * 0.998) return 0;
+
+        // 거래량 지속성 체크
+        double minSustainedVolume = avgVolume * 0.8;
+        for (int i = 0; i < 3; i++) {
+            double candleVolume = candles.get(i).getCandleAccTradePrice().doubleValue();
+            if (candleVolume < minSustainedVolume) {
+                return 0;
+            }
+        }
+
+        // 진입 시그널
+        boolean stochEntry =
+                stochK > stochD &&
+                        stochK < 0.8 &&
+                        rsi > rsiOversold &&
+                        currentPrice > middleBand * 0.98;
+
+        boolean volumeBreakout =
+                rsi > 45 &&
+                        (currentVolume / avgVolume) * 100 >= volumeThreshold &&
+                        currentPrice > middleBand;
+
+        // 거래대금 필터
+        double minTradeAmount = getMinTradeAmountByTime();
+        double avgTradeAmount = candles.subList(1, 4).stream()
+                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
+                .average().orElse(0);
+
+        if (avgTradeAmount < minTradeAmount * 0.7) return 0;
+
+        if (stochEntry || volumeBreakout) {
+            return 1;
+        }
+
+        return 0;
     }
 
     @Override

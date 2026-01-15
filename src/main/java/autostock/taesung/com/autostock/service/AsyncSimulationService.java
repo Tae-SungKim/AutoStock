@@ -11,7 +11,9 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -44,6 +46,10 @@ public class AsyncSimulationService {
     private final ObjectMapper objectMapper;
 
     private final SimulationTaskTxService txService;
+
+    @Lazy
+    @Autowired
+    private AsyncSimulationService self;
 
     @Value("${server.port:8080}")
     private int serverPort;
@@ -126,8 +132,8 @@ public class AsyncSimulationService {
         taskRepository.save(task);
         log.info("시뮬레이션 작업 생성: taskId={}, type={}", taskId, taskType);
 
-        // 비동기 실행 시작
-        executeTaskAsync(taskId);
+        // 비동기 실행 시작 (프록시를 통해 호출하여 @Async 작동 보장)
+        self.executeTaskAsync(taskId);
 
         return TaskResponse.builder()
                 .taskId(taskId)
@@ -149,8 +155,19 @@ public class AsyncSimulationService {
 
     @Async("simulationExecutor")
     public void executeTaskAsync(String taskId) {
-        SimulationTask task = taskRepository.findByTaskId(taskId).orElse(null);
-        if (task == null || task.getStatus() != TaskStatus.PENDING) return;
+        // 트랜잭션 커밋 대기를 위한 재시도 로직
+        SimulationTask task = null;
+        for (int i = 0; i < 5; i++) {
+            task = taskRepository.findByTaskId(taskId).orElse(null);
+            if (task != null) break;
+            try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+
+        if (task == null) {
+            log.error("비동기 작업 실행 실패: taskId={}를 찾을 수 없음", taskId);
+            return;
+        }
+        if (task.getStatus() != TaskStatus.PENDING) return;
 
         txService.markStarted(taskId, serverInstance);
 

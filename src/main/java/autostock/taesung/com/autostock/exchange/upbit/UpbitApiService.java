@@ -364,4 +364,21 @@ public class UpbitApiService {
     public List<ClosedOrder> getClosedOrdersByMarket(User user, String market) {
         return getClosedOrders(user, market, "done", 100);
     }
+
+    /**
+     * 호가창 조회 (Public API - 인증 불필요)
+     * @param market 마켓 코드 (예: KRW-BTC)
+     * @return 호가창 정보
+     */
+    public Orderbook getOrderbook(String market) {
+        String url = API_URL + "/orderbook?markets=" + market;
+        ResponseEntity<List<Orderbook>> response = restTemplate.exchange(
+                url,
+                HttpMethod.GET,
+                null,
+                new ParameterizedTypeReference<List<Orderbook>>() {}
+        );
+        List<Orderbook> orderbooks = response.getBody();
+        return (orderbooks != null && !orderbooks.isEmpty()) ? orderbooks.get(0) : null;
+    }
 }
