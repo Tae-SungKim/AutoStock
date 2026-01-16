@@ -75,18 +75,13 @@ public class BacktestService {
         List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
         Collections.reverse(candles);
 
+        List<BacktestResult> results = new ArrayList<>();
+
         // 각 전략별 백테스팅
-        List<BacktestResult> results = strategies.parallelStream()
-                .map(strategy -> {
-                    try {
-                        return executeBacktestSingleStrategy(market, strategy, candles, initialBalance);
-                    } catch (Exception e) {
-                        log.error("{} 전략 백테스팅 실패: {}", strategy.getStrategyName(), e.getMessage());
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+        for (TradingStrategy strategy : strategies) {
+            BacktestResult result = executeBacktestSingleStrategy(market, strategy, candles, initialBalance);
+            results.add(result);
+        }
 
         // 전략 조합 백테스팅
         BacktestResult combinedResult = executeBacktest(market, "Combined (Majority)", candles, initialBalance);
@@ -118,44 +113,39 @@ public class BacktestService {
                     .orElse(null);
         }
 
-        final TradingStrategy finalSelectedStrategy = selectedStrategy;
-        List<BacktestResult> results = markets.parallelStream()
-                .map(market -> {
-                    try {
-                        log.info("백테스팅 진행 중: {}", market);
+        for (String market : markets) {
+            try {
+                log.info("백테스팅 진행 중: {}", market);
 
-                        List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
-                        if (candles == null || candles.size() < 50) {
-                            log.warn("{} 캔들 데이터 부족, 스킵", market);
-                            return null;
-                        }
+                List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
+                if (candles == null || candles.size() < 50) {
+                    log.warn("{} 캔들 데이터 부족, 스킵", market);
+                    continue;
+                }
 
-                        Collections.reverse(candles);
+                Collections.reverse(candles);
 
-                        BacktestResult result;
-                        if (finalSelectedStrategy != null) {
-                            result = executeBacktestSingleStrategy(market, finalSelectedStrategy, candles, initialBalancePerMarket);
-                        } else {
-                            result = executeBacktest(market, "BollingerBandStrategy", candles, initialBalancePerMarket);
-                        }
-                        return result;
+                BacktestResult result;
+                if (selectedStrategy != null) {
+                    result = executeBacktestSingleStrategy(market, selectedStrategy, candles, initialBalancePerMarket);
+                } else {
+                    result = executeBacktest(market, "BollingerBandStrategy", candles, initialBalancePerMarket);
+                }
 
-                    } catch (Exception e) {
-                        log.error("{} 백테스팅 실패: {}", market, e.getMessage());
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+                marketResults.add(result);
+                profitRateByMarket.put(market, result.getTotalProfitRate());
 
-        for (BacktestResult result : results) {
-            marketResults.add(result);
-            profitRateByMarket.put(result.getMarket(), result.getTotalProfitRate());
+                // 종료 사유 통계 합산
+                if (result.getExitReasonStats() != null) {
+                    result.getExitReasonStats().forEach((reason, count) ->
+                            totalExitReasonStats.put(reason, totalExitReasonStats.getOrDefault(reason, 0) + count));
+                }
 
-            // 종료 사유 통계 합산
-            if (result.getExitReasonStats() != null) {
-                result.getExitReasonStats().forEach((reason, count) ->
-                        totalExitReasonStats.put(reason, totalExitReasonStats.getOrDefault(reason, 0) + count));
+                // API 속도 제한 방지
+                Thread.sleep(300);
+
+            } catch (Exception e) {
+                log.error("{} 백테스팅 실패: {}", market, e.getMessage());
             }
         }
 
@@ -268,43 +258,30 @@ public class BacktestService {
         List<BacktestResult> marketResults = new ArrayList<>();
         Map<String, Double> profitRateByMarket = new LinkedHashMap<>();
 
-        TradingStrategy selectedStrategy = strategies.stream()
-                .filter(s -> s.getStrategyName().equalsIgnoreCase(strategyName))
-                .findFirst()
-                .orElse(null);
+        for (String market : markets) {
+            try {
+                log.info("시뮬레이션 진행 중: {}", market);
 
-        final TradingStrategy finalSelectedStrategy = selectedStrategy;
-        List<BacktestResult> results = markets.parallelStream()
-                .map(market -> {
-                    try {
-                        log.info("시뮬레이션 진행 중: {}", market);
+                List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
+                if (candles == null || candles.size() < 50) {
+                    log.warn("{} 캔들 데이터 부족, 스킵", market);
+                    continue;
+                }
 
-                        List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
-                        if (candles == null || candles.size() < 50) {
-                            log.warn("{} 캔들 데이터 부족, 스킵", market);
-                            return null;
-                        }
+                Collections.reverse(candles);
+                //BacktestResult result = executeBacktest(market, strategyName, candles, initialBalancePerMarket);
+                //BacktestResult result = executeRealTradingSimulation(market, candles, initialBalancePerMarket);
 
-                        Collections.reverse(candles);
-
-                        if (finalSelectedStrategy != null) {
-                            return executeBacktestSingleStrategy(market, finalSelectedStrategy, candles, initialBalancePerMarket);
-                        } else {
-                            // Default behavior or error
-                            log.error("전략이 지정되지 않았습니다.");
-                            return null;
-                        }
-                    } catch (Exception e) {
-                        log.error("{} 시뮬레이션 실패: {}", market, e.getMessage());
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
-
-        for (BacktestResult result : results) {
-            marketResults.add(result);
-            profitRateByMarket.put(result.getMarket(), result.getTotalProfitRate());
+                TradingStrategy selectedStrategy = strategies.stream()
+                        .filter(s -> s.getStrategyName().equalsIgnoreCase(strategyName))
+                        .findFirst()
+                        .orElseThrow(() -> new IllegalArgumentException("전략을 찾을 수 없습니다: " + strategyName));
+                BacktestResult result = executeBacktestSingleStrategy(market, selectedStrategy, candles, initialBalancePerMarket);
+                marketResults.add(result);
+                profitRateByMarket.put(market, result.getTotalProfitRate());
+            } catch (Exception e) {
+                log.error("{} 시뮬레이션 실패: {}", market, e.getMessage());
+            }
         }
 
         if (marketResults.isEmpty()) {
@@ -934,22 +911,9 @@ public class BacktestService {
      * DB 데이터를 사용한 백테스팅 실행
      */
     public BacktestResult runBacktestFromDb(String market, double initialBalance, Integer unit) {
-        return runBacktestFromDb(market, initialBalance, unit, null, null);
-    }
-
-    /**
-     * DB 데이터를 사용한 백테스팅 실행 (기간 지정)
-     */
-    public BacktestResult runBacktestFromDb(String market, double initialBalance, Integer unit, String startDate, String endDate) {
         log.info("========== DB 데이터 기반 백테스팅 시작 ==========");
-        String startKst = formatKstDate(startDate, false);
-        String endKst = formatKstDate(endDate, true);
-
         List<CandleData> candleDataList;
-        if (startKst != null && endKst != null) {
-            candleDataList = candleDataRepository.findByMarketAndUnitAndCandleDateTimeKstBetweenOrderByCandleDateTimeKstAsc(
-                    market, unit != null ? unit : 1, startKst, endKst);
-        } else if (unit != null) {
+        if (unit != null) {
             candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
         } else {
             candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
@@ -967,22 +931,9 @@ public class BacktestService {
      * DB 데이터를 사용한 실제 매매 시뮬레이션
      */
     public BacktestResult runRealTradingSimulationFromDb(String market, double initialBalance, Integer unit) {
-        return runRealTradingSimulationFromDb(market, initialBalance, unit, null, null);
-    }
-
-    /**
-     * DB 데이터를 사용한 실제 매매 시뮬레이션 (기간 지정)
-     */
-    public BacktestResult runRealTradingSimulationFromDb(String market, double initialBalance, Integer unit, String startDate, String endDate) {
         log.info("========== DB 데이터 기반 실제 매매 시뮬레이션 시작 ==========");
-        String startKst = formatKstDate(startDate, false);
-        String endKst = formatKstDate(endDate, true);
-
         List<CandleData> candleDataList;
-        if (startKst != null && endKst != null) {
-            candleDataList = candleDataRepository.findByMarketAndUnitAndCandleDateTimeKstBetweenOrderByCandleDateTimeKstAsc(
-                    market, unit != null ? unit : 1, startKst, endKst);
-        } else if (unit != null) {
+        if (unit != null) {
             candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
         } else {
             candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
@@ -1001,24 +952,10 @@ public class BacktestService {
      */
     public BacktestResult runBacktestWithStrategyFromDb(String market, String strategyName,
                                                          double initialBalance, Integer unit) {
-        return runBacktestWithStrategyFromDb(market, strategyName, initialBalance, unit, null, null);
-    }
-
-    /**
-     * DB 데이터를 사용한 단일 전략 백테스팅 (기간 지정)
-     */
-    public BacktestResult runBacktestWithStrategyFromDb(String market, String strategyName,
-                                                         double initialBalance, Integer unit,
-                                                         String startDate, String endDate) {
         log.info("========== DB 데이터 기반 {} 전략 백테스팅 시작 ==========", strategyName);
-        String startKst = formatKstDate(startDate, false);
-        String endKst = formatKstDate(endDate, true);
 
         List<CandleData> candleDataList;
-        if (startKst != null && endKst != null) {
-            candleDataList = candleDataRepository.findByMarketAndUnitAndCandleDateTimeKstBetweenOrderByCandleDateTimeKstAsc(
-                    market, unit != null ? unit : 1, startKst, endKst);
-        } else if (unit != null) {
+        if (unit != null) {
             candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
         } else {
             candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
@@ -1044,25 +981,11 @@ public class BacktestService {
      */
     public MultiCoinBacktestResult runMultiCoinBacktestFromDb(List<String> markets, String strategyName,
                                                                double initialBalancePerMarket, Integer unit) {
-        return runMultiCoinBacktestFromDb(markets, strategyName, initialBalancePerMarket, unit, null, null);
-    }
-
-    /**
-     * DB 데이터를 사용한 멀티 코인 단일 전략 백테스팅 (기간 지정)
-     */
-    public MultiCoinBacktestResult runMultiCoinBacktestFromDb(List<String> markets, String strategyName,
-                                                               double initialBalancePerMarket, Integer unit,
-                                                               String startDate, String endDate) {
         log.info("========== DB 데이터 기반 멀티 코인 백테스팅 시작 ==========");
-        log.info("마켓 수: {}, 전략: {}, 마켓당 자본: {}, 기간: {} ~ {}", 
-                markets.size(), strategyName, initialBalancePerMarket, startDate, endDate);
+        log.info("마켓 수: {}, 전략: {}, 마켓당 자본: {}", markets.size(), strategyName, initialBalancePerMarket);
 
         List<BacktestResult> marketResults = new ArrayList<>();
         Map<String, Double> profitRateByMarket = new LinkedHashMap<>();
-
-        // 날짜 포맷 변환 (yyyyMMdd -> yyyy-MM-ddTHH:mm:ss)
-        String startKst = formatKstDate(startDate, false);
-        String endKst = formatKstDate(endDate, true);
 
         TradingStrategy selectedStrategy = null;
         if (strategyName != null && !strategyName.isEmpty()) {
@@ -1078,40 +1001,33 @@ public class BacktestService {
                     try {
                         log.info("DB 백테스팅 진행 중: {}", market);
 
-                        List<CandleData> candleDataList;
-                        if (startKst != null && endKst != null) {
-                            candleDataList = candleDataRepository.findByMarketAndUnitAndCandleDateTimeKstBetweenOrderByCandleDateTimeKstAsc(
-                                    market, unit != null ? unit : 1, startKst, endKst);
-                        } else if (unit != null) {
-                            candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
-                        } else {
-                            candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
-                        }
+                List<CandleData> candleDataList;
+                if (unit != null) {
+                    candleDataList = candleDataRepository.findByMarketAndUnitOrderByCandleDateTimeKstAsc(market, unit);
+                } else {
+                    candleDataList = candleDataRepository.findByMarketOrderByCandleDateTimeKstAsc(market);
+                }
 
-                        if (candleDataList.isEmpty() || candleDataList.size() < 50) {
-                            log.warn("{} DB 캔들 데이터 부족 ({}개), 스킵", market, candleDataList.size());
-                            return null;
-                        }
+                if (candleDataList.isEmpty() || candleDataList.size() < 50) {
+                    log.warn("{} DB 캔들 데이터 부족 ({}개), 스킵", market, candleDataList.size());
+                    continue;
+                }
 
-                        List<Candle> candles = convertToCandles(candleDataList);
+                List<Candle> candles = convertToCandles(candleDataList);
 
-                        if (finalSelectedStrategy != null) {
-                            return executeBacktestSingleStrategy(market, finalSelectedStrategy, candles, initialBalancePerMarket);
-                        } else {
-                            return executeBacktest(market, "Combined", candles, initialBalancePerMarket);
-                        }
+                BacktestResult result;
+                if (selectedStrategy != null) {
+                    result = executeBacktestSingleStrategy(market, selectedStrategy, candles, initialBalancePerMarket);
+                } else {
+                    result = executeBacktest(market, "Combined", candles, initialBalancePerMarket);
+                }
 
-                    } catch (Exception e) {
-                        log.error("{} DB 백테스팅 실패: {}", market, e.getMessage());
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+                marketResults.add(result);
+                profitRateByMarket.put(market, result.getTotalProfitRate());
 
-        for (BacktestResult result : results) {
-            marketResults.add(result);
-            profitRateByMarket.put(result.getMarket(), result.getTotalProfitRate());
+            } catch (Exception e) {
+                log.error("{} DB 백테스팅 실패: {}", market, e.getMessage());
+            }
         }
 
         if (marketResults.isEmpty()) {
@@ -1173,24 +1089,13 @@ public class BacktestService {
     }
 
     /**
-     * 날짜 포맷 변환 (yyyyMMdd -> yyyy-MM-ddTHH:mm:ss)
-     */
-    private String formatKstDate(String yyyyMMdd, boolean endOfDay) {
-        if (yyyyMMdd == null || yyyyMMdd.length() != 8) return null;
-        try {
-            String year = yyyyMMdd.substring(0, 4);
-            String month = yyyyMMdd.substring(4, 6);
-            String day = yyyyMMdd.substring(6, 8);
-            return year + "-" + month + "-" + day + (endOfDay ? "T23:59:59" : "T00:00:00");
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
      * DB에 저장된 마켓 목록 조회
      */
     public List<String> getAvailableMarketsFromDb() {
-        return candleDataRepository.findDistinctMarkets();
+        List<CandleData> allData = candleDataRepository.findAll();
+        return allData.stream()
+                .map(CandleData::getMarket)
+                .distinct()
+                .collect(Collectors.toList());
     }
 }

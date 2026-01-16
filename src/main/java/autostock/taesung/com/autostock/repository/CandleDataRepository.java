@@ -15,7 +15,6 @@ public interface CandleDataRepository extends JpaRepository<CandleData, Long> {
     Optional<CandleData> findByMarketAndCandleDateTimeKst(String market, String candleDateTimeKst);
     List<CandleData> findByMarketOrderByCandleDateTimeKstAsc(String market);
     List<CandleData> findByMarketAndUnitOrderByCandleDateTimeKstAsc(String market, int unit);
-    List<CandleData> findByMarketAndUnitAndCandleDateTimeKstBetweenOrderByCandleDateTimeKstAsc(String market, int unit, String start, String end);
 
     // 가장 최신 캔들 하나 가져오기
     Optional<CandleData> findFirstByMarketAndUnitOrderByCandleDateTimeKstDesc(String market, int unit);
