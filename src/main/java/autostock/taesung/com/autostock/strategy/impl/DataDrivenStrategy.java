@@ -44,7 +44,17 @@ public class DataDrivenStrategy implements TradingStrategy {
     private static final int STOP_LOSS_COOLDOWN_MINUTES = 5;
     private static final int MIN_HOLD_MINUTES = 3;
 
-    private Double targetPrice = null;
+    private final ThreadLocal<Double> targetPrice = new ThreadLocal<>();
+
+    @Override
+    public Double getTargetPrice() {
+        return targetPrice.get();
+    }
+
+    @Override
+    public void clearPosition(String market) {
+        targetPrice.remove();
+    }
 
     @PostConstruct
     public void init() {
@@ -161,16 +171,50 @@ public class DataDrivenStrategy implements TradingStrategy {
 
     @Override
     public int analyze(String market, List<Candle> candles) {
+        StrategyOptimizerService.OptimizedParams params = getParams(market);
+
+        // 최근 거래 내역 조회
+        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
+                .stream().findFirst().orElse(null);
+
+        boolean holding = latest != null &&
+                latest.getTradeType() == TradeHistory.TradeType.BUY;
+        
+        double buyPrice = holding ? latest.getPrice().doubleValue() : 0;
+        double currentPrice = candles.isEmpty() ? 0 : candles.get(0).getTradePrice().doubleValue();
+        double highestPrice = buyPrice;
+        LocalDateTime buyCreatedAt = LocalDateTime.now();
+
+        if (holding) {
+            highestPrice = latest.getHighestPrice() == null ? currentPrice : latest.getHighestPrice().doubleValue();
+            if (currentPrice > highestPrice) {
+                latest.setHighestPrice(BigDecimal.valueOf(currentPrice));
+                tradeHistoryRepository.save(latest);
+                highestPrice = currentPrice;
+            }
+            buyCreatedAt = latest.getCreatedAt();
+        }
+
+        return analyzeLogic(market, candles, params, holding, buyPrice, highestPrice, buyCreatedAt, 
+                latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL,
+                latest != null ? latest.getCreatedAt() : LocalDateTime.now());
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        StrategyOptimizerService.OptimizedParams params = getParams(market);
+        boolean holding = position != null && position.isHolding();
+        double buyPrice = holding ? position.getBuyPrice() : 0;
+        double highestPrice = holding ? position.getHighestPrice() : 0;
+        LocalDateTime buyCreatedAt = (holding && position.getBuyTime() != null) ? position.getBuyTime() : LocalDateTime.now();
+
+        return analyzeLogic(market, candles, params, holding, buyPrice, highestPrice, buyCreatedAt, false, LocalDateTime.now());
+    }
+
+    private int analyzeLogic(String market, List<Candle> candles, StrategyOptimizerService.OptimizedParams params,
+                             boolean holding, double buyPrice, double highestPrice, LocalDateTime buyCreatedAt,
+                             boolean isSell, LocalDateTime lastTradeAt) {
         try {
-            StrategyOptimizerService.OptimizedParams params = getParams(market);
-
-            // 최근 거래 내역 조회
-            TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
-                    .stream().findFirst().orElse(null);
-
-            boolean holding = latest != null &&
-                    latest.getTradeType() == TradeHistory.TradeType.BUY;
-
             // 지표 계산
             int bp = params.getBollingerPeriod();
             double bm = params.getBollingerMultiplier();
@@ -201,24 +245,12 @@ public class DataDrivenStrategy implements TradingStrategy {
 
             // ===== 매도 로직 (보유 중) =====
             if (holding) {
-                double buyPrice = latest.getPrice().doubleValue();
-                double highest = latest.getHighestPrice() == null
-                        ? currentPrice
-                        : latest.getHighestPrice().doubleValue();
-
-                if (currentPrice > highest) {
-                    latest.setHighestPrice(BigDecimal.valueOf(currentPrice));
-                    tradeHistoryRepository.save(latest);
-                    highest = currentPrice;
-                }
-
                 double profitRate = (currentPrice - buyPrice) / buyPrice * 100;
                 double stopLossPrice = buyPrice * (1 + params.getStopLossRate() / 100);
                 double takeProfitPrice = buyPrice * (1 + params.getTakeProfitRate() / 100);
-                double trailingStopPrice = highest * (1 - params.getTrailingStopRate() / 100);
+                double trailingStopPrice = highestPrice * (1 - params.getTrailingStopRate() / 100);
 
-                long holdingMinutes = Duration.between(
-                        latest.getCreatedAt(), LocalDateTime.now()).toMinutes();
+                long holdingMinutes = Duration.between(buyCreatedAt, LocalDateTime.now()).toMinutes();
                 boolean canCheckStopLoss = holdingMinutes >= MIN_HOLD_MINUTES;
 
                 // 손절
@@ -237,9 +269,9 @@ public class DataDrivenStrategy implements TradingStrategy {
 
                 // 트레일링 스탑
                 if (canCheckStopLoss && currentPrice <= trailingStopPrice &&
-                        highest > buyPrice * 1.01) {
+                        highestPrice > buyPrice * 1.01) {
                     log.info("[{}] 트레일링 종료 - 최고가: {}, 현재가: {}, 손익: {:.2f}%",
-                            market, highest, currentPrice, profitRate);
+                            market, highestPrice, currentPrice, profitRate);
                     return -1;
                 }
 
@@ -254,9 +286,9 @@ public class DataDrivenStrategy implements TradingStrategy {
             }
 
             // ===== 손절 쿨다운 체크 =====
-            if (latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL) {
+            if (isSell) {
                 long minutesSinceLastSell = Duration.between(
-                        latest.getCreatedAt(), LocalDateTime.now()).toMinutes();
+                        lastTradeAt, LocalDateTime.now()).toMinutes();
                 if (minutesSinceLastSell < STOP_LOSS_COOLDOWN_MINUTES) {
                     return 0;
                 }
@@ -308,14 +340,14 @@ public class DataDrivenStrategy implements TradingStrategy {
                     rsi > 30;
 
             if (oversoldNearLower || risingMomentum || goldenBreak) {
-                this.targetPrice = currentPrice + atr * 2;
+                this.targetPrice.set(currentPrice + atr * 2);
                 log.info("[{}] 매수 신호 - RSI: {:.1f}, 가격: {}, 조건: {}",
                         market, rsi, currentPrice,
                         oversoldNearLower ? "과매도" : risingMomentum ? "모멘텀" : "돌파");
                 return 1;
             }
 
-            this.targetPrice = null;
+            this.targetPrice.remove();
             return 0;
 
         } catch (Exception e) {
@@ -372,47 +404,6 @@ public class DataDrivenStrategy implements TradingStrategy {
         if (hour >= 9 && hour < 18) return 50_000_000;
         if (hour >= 18 && hour < 22) return 80_000_000;
         return 100_000_000;
-    }
-
-    @Override
-    public Double getTargetPrice() {
-        return targetPrice;
-    }
-
-    @Override
-    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
-        if (candles.size() < 30) return 0;
-
-        StrategyOptimizerService.OptimizedParams params = getParams(market);
-        boolean holding = position != null && position.isHolding();
-        double currentPrice = candles.get(0).getTradePrice().doubleValue();
-
-        if (holding) {
-            double buyPrice = position.getBuyPrice();
-            double highest = position.getHighestPrice();
-
-            // 손절
-            if (currentPrice <= buyPrice * (1 + params.getStopLossRate() / 100)) {
-                return exit(ExitReason.STOP_LOSS_FIXED);
-            }
-
-            // 익절
-            if (currentPrice >= buyPrice * (1 + params.getTakeProfitRate() / 100)) {
-                return exit(ExitReason.TAKE_PROFIT);
-            }
-
-            // 트레일링 스탑
-            if (highest > buyPrice * 1.01 && currentPrice <= highest * (1 - params.getTrailingStopRate() / 100)) {
-                return exit(ExitReason.TRAILING_STOP);
-            }
-
-            // 타임아웃 (예시: 60분 이상 보유 시)
-            // (BacktestPosition에 진입시간이 없으므로 필요 시 추가 확장 가능하나, 여기서는 생략하거나 추측 구현 지양)
-
-            return 0;
-        }
-
-        return analyze(market, candles);
     }
 
     @Override

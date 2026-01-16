@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
@@ -79,7 +80,17 @@ public class BollingerBandStrategy implements TradingStrategy {
     private final StrategyParameterService strategyParameterService;
     private final UpbitApiService upbitApiService;
 
-    private Double targetPrice = null;
+    private final ThreadLocal<Double> targetPrice = new ThreadLocal<>();
+
+    @Override
+    public Double getTargetPrice() {
+        return targetPrice.get();
+    }
+
+    @Override
+    public void clearPosition(String market) {
+        targetPrice.remove();
+    }
 
     @Override
     public int analyze(List<Candle> candles) {
@@ -88,7 +99,44 @@ public class BollingerBandStrategy implements TradingStrategy {
 
     @Override
     public int analyze(String market, List<Candle> candles) {
+        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
+                .stream().findFirst().orElse(null);
 
+        boolean holding = latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
+        double buyPrice = holding ? latest.getPrice().doubleValue() : 0;
+        double currentPrice = candles.isEmpty() ? 0 : candles.get(0).getTradePrice().doubleValue();
+        
+        double highestPrice = buyPrice;
+        LocalDateTime buyCreatedAt = LocalDateTime.now();
+        boolean isSell = latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL;
+        LocalDateTime lastTradeAt = latest != null ? latest.getCreatedAt() : LocalDateTime.now();
+
+        if (holding) {
+            highestPrice = latest.getHighestPrice() == null ? currentPrice : latest.getHighestPrice().doubleValue();
+            if (currentPrice > highestPrice) {
+                latest.setHighestPrice(BigDecimal.valueOf(currentPrice));
+                tradeHistoryRepository.save(latest);
+                highestPrice = currentPrice;
+            }
+            buyCreatedAt = latest.getCreatedAt();
+        }
+
+        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, isSell, lastTradeAt);
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        boolean holding = position != null && position.isHolding();
+        double buyPrice = holding ? position.getBuyPrice() : 0;
+        double highestPrice = holding ? position.getHighestPrice() : 0;
+        LocalDateTime buyCreatedAt = (holding && position.getBuyTime() != null) ? position.getBuyTime() : LocalDateTime.now();
+        
+        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, false, LocalDateTime.now());
+    }
+
+    private int analyzeLogic(String market, List<Candle> candles, boolean holding, double buyPrice, 
+                             double highestPrice, LocalDateTime buyCreatedAt, boolean isSell, LocalDateTime lastTradeAt) {
+        
         if (candles.size() < 30) return 0;
 
         int period = strategyParameterService.getIntParam(getStrategyName(), null, "bollinger.period", PERIOD);
@@ -101,27 +149,19 @@ public class BollingerBandStrategy implements TradingStrategy {
         double rsiOverbought = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.overbought", 70.0);
         int rsiPeriod = strategyParameterService.getIntParam(getStrategyName(), null, "rsi.period", 14);
 
-        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
-                .stream().findFirst().orElse(null);
-
-        boolean holding = latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
-
         double[] bands = indicator.calculateBollingerBands(candles, period, multiplier);
         double middleBand = bands[0];
         double upperBand = bands[1];
         double lowerBand = bands[2];
 
         double bandWidthPercent = ((upperBand - lowerBand) / middleBand) * 100;
-
         double rsi = calculateRSI(candles, rsiPeriod);
         double atr = calculateATR(candles, rsiPeriod);
-
         double[] stoch = calculateStochRSI(candles, rsiPeriod, rsiPeriod);
         double stochK = stoch[0];
         double stochD = stoch[1];
 
         double currentPrice = candles.get(0).getTradePrice().doubleValue();
-
         double currentVolume = candles.get(0).getCandleAccTradePrice().doubleValue();
         double avgVolume = candles.subList(1, 6).stream()
                 .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
@@ -132,17 +172,6 @@ public class BollingerBandStrategy implements TradingStrategy {
          * [6] 손익 계산 시 비용 반영
          * ===================================================== */
         if (holding) {
-            double buyPrice = latest.getPrice().doubleValue();
-            double highest = latest.getHighestPrice() == null
-                    ? currentPrice
-                    : latest.getHighestPrice().doubleValue();
-
-            if (currentPrice > highest) {
-                latest.setHighestPrice(BigDecimal.valueOf(currentPrice));
-                tradeHistoryRepository.save(latest);
-                highest = currentPrice;
-            }
-
             // [6] 실제 매수가 반영 (슬리피지 + 수수료)
             double realBuyPrice = buyPrice * (1 + TOTAL_COST);
             // [6] 실제 매도가 반영
@@ -161,17 +190,14 @@ public class BollingerBandStrategy implements TradingStrategy {
             double atrTakeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
             double takeProfit = Math.min(fixedTakeProfit, atrTakeProfit);
 
-            double trailingStop = highest - atr * TRAILING_STOP_ATR_MULT;
+            double trailingStop = highestPrice - atr * TRAILING_STOP_ATR_MULT;
 
-            long holdingMinutes = java.time.Duration
-                    .between(latest.getCreatedAt(), java.time.LocalDateTime.now())
-                    .toMinutes();
+            long holdingMinutes = java.time.Duration.between(buyCreatedAt, LocalDateTime.now()).toMinutes();
 
             // [8] 손절 로깅 개선
             if (holdingMinutes >= MIN_HOLD_CANDLES && currentPrice <= stopLoss) {
                 log.info("[{}] 손절 - BuyPrice: {}, CurrentPrice: {}, Loss: {}%",
-                        market, String.format("%.0f", buyPrice),
-                        String.format("%.0f", currentPrice),
+                        market, String.format("%.0f", buyPrice), String.format("%.0f", currentPrice),
                         String.format("%.2f", realProfitRate * 100));
                 return -1;
             }
@@ -180,8 +206,7 @@ public class BollingerBandStrategy implements TradingStrategy {
             if (currentPrice >= takeProfit && rsi > rsiOverbought) {
                 if (realProfitRate >= MIN_PROFIT_RATE) {
                     log.info("[{}] 익절 - BuyPrice: {}, CurrentPrice: {}, RealProfit: {}%",
-                            market, String.format("%.0f", buyPrice),
-                            String.format("%.0f", currentPrice),
+                            market, String.format("%.0f", buyPrice), String.format("%.0f", currentPrice),
                             String.format("%.2f", realProfitRate * 100));
                     return -1;
                 } else {
@@ -191,14 +216,10 @@ public class BollingerBandStrategy implements TradingStrategy {
             }
 
             // [8] 트레일링 로깅 개선
-            if (holdingMinutes >= MIN_HOLD_CANDLES &&
-                    currentPrice <= trailingStop &&
-                    highest > buyPrice * 1.01) {
+            if (holdingMinutes >= MIN_HOLD_CANDLES && currentPrice <= trailingStop && highestPrice > buyPrice * 1.01) {
                 log.info("[{}] 트레일링 종료 - BuyPrice: {}, Highest: {}, CurrentPrice: {}, Profit: {}%",
-                        market, String.format("%.0f", buyPrice),
-                        String.format("%.0f", highest),
-                        String.format("%.0f", currentPrice),
-                        String.format("%.2f", realProfitRate * 100));
+                        market, String.format("%.0f", buyPrice), String.format("%.0f", highestPrice),
+                        String.format("%.0f", currentPrice), String.format("%.2f", realProfitRate * 100));
                 return -1;
             }
 
@@ -208,10 +229,8 @@ public class BollingerBandStrategy implements TradingStrategy {
         /* =====================================================
          * 2️⃣ 손절 쿨다운
          * ===================================================== */
-        if (latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL) {
-            long diff = java.time.Duration
-                    .between(latest.getCreatedAt(), java.time.LocalDateTime.now())
-                    .toMinutes();
+        if (isSell) {
+            long diff = java.time.Duration.between(lastTradeAt, LocalDateTime.now()).toMinutes();
             if (diff < STOP_LOSS_COOLDOWN_CANDLES) return 0;
         }
 
@@ -222,10 +241,7 @@ public class BollingerBandStrategy implements TradingStrategy {
         if (!isHigherLowStructure(candles)) return 0;
         if (isFakeRebound(candles)) return 0;
 
-        double candleMove = Math.abs(
-                candles.get(0).getTradePrice().doubleValue()
-                        - candles.get(1).getTradePrice().doubleValue()
-        );
+        double candleMove = Math.abs(candles.get(0).getTradePrice().doubleValue() - candles.get(1).getTradePrice().doubleValue());
         if (candleMove > atr * 0.8) return 0;
         if (currentVolume < avgVolume * 0.9) return 0;
         if (rsi > rsiOverbought) return 0;
@@ -233,9 +249,7 @@ public class BollingerBandStrategy implements TradingStrategy {
         /* =====================================================
          * 4️⃣ 진입 조건 강화 - 추세 확인
          * ===================================================== */
-        double avgPrice10 = candles.subList(0, 10).stream()
-                .mapToDouble(c -> c.getTradePrice().doubleValue())
-                .average().orElse(currentPrice);
+        double avgPrice10 = candles.subList(0, 10).stream().mapToDouble(c -> c.getTradePrice().doubleValue()).average().orElse(currentPrice);
         if (currentPrice <= avgPrice10 * 0.998) {
             log.debug("[{}] 하락 추세 감지 - 진입 차단", market);
             return 0;
@@ -246,8 +260,7 @@ public class BollingerBandStrategy implements TradingStrategy {
          * ===================================================== */
         double minSustainedVolume = avgVolume * 0.8;
         for (int i = 0; i < 3; i++) {
-            double candleVolume = candles.get(i).getCandleAccTradePrice().doubleValue();
-            if (candleVolume < minSustainedVolume) {
+            if (candles.get(i).getCandleAccTradePrice().doubleValue() < minSustainedVolume) {
                 log.debug("[{}] 거래량 지속성 부족 - 진입 차단", market);
                 return 0;
             }
@@ -256,25 +269,14 @@ public class BollingerBandStrategy implements TradingStrategy {
         /* =====================================================
          * 5️⃣ 진입 시그널
          * ===================================================== */
-        boolean stochEntry =
-                stochK > stochD &&
-                        stochK < 0.8 &&
-                        rsi > rsiOversold &&
-                        currentPrice > middleBand * 0.98;
-
-        boolean volumeBreakout =
-                rsi > 45 &&
-                        (currentVolume / avgVolume) * 100 >= volumeThreshold &&
-                        currentPrice > middleBand;
+        boolean stochEntry = stochK > stochD && stochK < 0.8 && rsi > rsiOversold && currentPrice > middleBand * 0.98;
+        boolean volumeBreakout = rsi > 45 && (currentVolume / avgVolume) * 100 >= volumeThreshold && currentPrice > middleBand;
 
         /* =====================================================
          * 6️⃣ 거래대금 필터
          * ===================================================== */
         double minTradeAmount = getMinTradeAmountByTime();
-        double avgTradeAmount = candles.subList(1, 4).stream()
-                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
-                .average().orElse(0);
-
+        double avgTradeAmount = candles.subList(1, 4).stream().mapToDouble(c -> c.getCandleAccTradePrice().doubleValue()).average().orElse(0);
         if (avgTradeAmount < minTradeAmount * 0.7) return 0;
 
         /* =====================================================
@@ -283,136 +285,38 @@ public class BollingerBandStrategy implements TradingStrategy {
         if (stochEntry || volumeBreakout) {
             // [3] 호가창 최종 검증 (진입 시에만 호출 - API 부담 최소화)
             if (!validateOrderbookForEntry(market, currentPrice)) {
-                targetPrice = null;
+                targetPrice.remove();
                 return 0;  // 검증 실패 시 진입 포기
             }
-
-            this.targetPrice = currentPrice + atr * 1.5;
+            this.targetPrice.set(currentPrice + atr * 1.5);
             // [8] 매수 진입 로깅 개선
-            log.info("[{}] 매수 진입 - Price: {}, RSI: {}, ATR: {}",
-                    market, String.format("%.0f", currentPrice),
-                    String.format("%.1f", rsi),
-                    String.format("%.2f", atr));
+            log.info("[{}] 매수 진입 - Price: {}, RSI: {}, ATR: {}", market, String.format("%.0f", currentPrice),
+                    String.format("%.1f", rsi), String.format("%.2f", atr));
             return 1;
         }
 
-        targetPrice = null;
+        targetPrice.remove();
         return 0;
     }
 
-    /* =====================================================
-     * [3] 호가창 검증 메서드 (진입 시에만 호출)
-     * - 1분에 최대 1~2회만 호출 (API 부담 최소)
-     * - 검증 실패 시 진입 포기
-     * ===================================================== */
-    /**
-     * 매수 진입 직전 호가창 최종 검증
-     * @param market 마켓 코드
-     * @param currentPrice 현재가
-     * @return 검증 통과 여부
-     */
     private boolean validateOrderbookForEntry(String market, double currentPrice) {
         try {
             Orderbook ob = upbitApiService.getOrderbook(market);
-            if (ob == null) {
-                log.warn("[{}] 호가창 조회 실패", market);
-                return false;
-            }
-
-            // ✅ 1. 스프레드 체크 (0.3% 이하만 진입)
+            if (ob == null) return false;
             double askPrice = ob.getAskPrice(0);
             double bidPrice = ob.getBidPrice(0);
             double spread = (askPrice - bidPrice) / bidPrice;
-
-            if (spread > MAX_SPREAD_RATE) {
-                log.info("[{}] 스프레드 과다: {}% > 0.3%",
-                        market, String.format("%.2f", spread * 100));
-                return false;
-            }
-
-            // ✅ 2. 호가 불균형 체크 (매수세 55% 이상)
-            double bidVol0 = ob.getBidSize(0);
-            double bidVol1 = ob.getBidSize(1);
-            double bidVol2 = ob.getBidSize(2);
-            double askVol0 = ob.getAskSize(0);
-            double askVol1 = ob.getAskSize(1);
-            double askVol2 = ob.getAskSize(2);
-
-            double totalBid = bidVol0 + bidVol1 + bidVol2;
-            double totalAsk = askVol0 + askVol1 + askVol2;
+            if (spread > MAX_SPREAD_RATE) return false;
+            double totalBid = ob.getBidSize(0) + ob.getBidSize(1) + ob.getBidSize(2);
+            double totalAsk = ob.getAskSize(0) + ob.getAskSize(1) + ob.getAskSize(2);
             double imbalance = totalBid / (totalBid + totalAsk);
-
-            if (imbalance < MIN_BID_IMBALANCE) {
-                log.info("[{}] 매수세 부족: {}% < 55%",
-                        market, String.format("%.1f", imbalance * 100));
-                return false;
-            }
-
-            // ✅ 3. 급격한 가격 괴리 체크
+            if (imbalance < MIN_BID_IMBALANCE) return false;
             double priceDiff = Math.abs(currentPrice - bidPrice) / currentPrice;
-            if (priceDiff > MAX_PRICE_DIFF_RATE) {
-                log.warn("[{}] 가격 괴리 과다: {}%",
-                        market, String.format("%.2f", priceDiff * 100));
-                return false;
-            }
-
-            log.info("[{}] 호가창 검증 통과 - Spread: {}%, Imbalance: {}%",
-                    market, String.format("%.2f", spread * 100),
-                    String.format("%.1f", imbalance * 100));
-            return true;
-
+            return priceDiff <= MAX_PRICE_DIFF_RATE;
         } catch (Exception e) {
-            // [9] 에러 처리 - 오류 시 안전하게 진입 포기
-            log.error("[{}] 호가창 검증 오류: {}", market, e.getMessage());
             return false;
         }
     }
-
-    /* =====================================================
-     * [5] 지정가 주문 가격 계산 메서드
-     * ===================================================== */
-    /**
-     * 지정가 매수 가격 계산
-     * - 최우선 매수호가 + 1틱 (0.01%)
-     * - 슬리피지 최소화
-     */
-    public double calculateLimitBuyPrice(String market) {
-        try {
-            Orderbook ob = upbitApiService.getOrderbook(market);
-            if (ob == null) return 0;
-
-            double bidPrice = ob.getBidPrice(0);
-            double tickSize = bidPrice * 0.0001;  // 0.01% = 1틱
-
-            return bidPrice + tickSize;
-
-        } catch (Exception e) {
-            log.error("[{}] 지정가 매수가격 계산 실패: {}", market, e.getMessage());
-            return 0;
-        }
-    }
-
-    /**
-     * 지정가 매도 가격 계산
-     * - 최우선 매도호가 - 1틱 (0.01%)
-     */
-    public double calculateLimitSellPrice(String market) {
-        try {
-            Orderbook ob = upbitApiService.getOrderbook(market);
-            if (ob == null) return 0;
-
-            double askPrice = ob.getAskPrice(0);
-            double tickSize = askPrice * 0.0001;
-
-            return askPrice - tickSize;
-
-        } catch (Exception e) {
-            log.error("[{}] 지정가 매도가격 계산 실패: {}", market, e.getMessage());
-            return 0;
-        }
-    }
-
-    /* ================== 보조 메서드 ================== */
 
     private boolean isHigherLowStructure(List<Candle> candles) {
         double l0 = candles.get(0).getLowPrice().doubleValue();
@@ -424,23 +328,18 @@ public class BollingerBandStrategy implements TradingStrategy {
     private boolean isFakeRebound(List<Candle> candles) {
         Candle c0 = candles.get(0);
         Candle c1 = candles.get(1);
-
         double body0 = Math.abs(c0.getTradePrice().doubleValue() - c0.getOpeningPrice().doubleValue());
         double range0 = c0.getHighPrice().doubleValue() - c0.getLowPrice().doubleValue();
-
         double body1 = Math.abs(c1.getTradePrice().doubleValue() - c1.getOpeningPrice().doubleValue());
         double range1 = c1.getHighPrice().doubleValue() - c1.getLowPrice().doubleValue();
-
         return body0 / range0 < 0.35 && body1 / range1 < 0.35;
     }
 
     private double calculateRSI(List<Candle> candles, int period) {
         double gain = 0, loss = 0;
         for (int i = 0; i < period; i++) {
-            double diff = candles.get(i).getTradePrice().doubleValue()
-                    - candles.get(i + 1).getTradePrice().doubleValue();
-            if (diff > 0) gain += diff;
-            else loss -= diff;
+            double diff = candles.get(i).getTradePrice().doubleValue() - candles.get(i + 1).getTradePrice().doubleValue();
+            if (diff > 0) gain += diff; else loss -= diff;
         }
         if (loss == 0) return 100;
         double rs = gain / loss;
@@ -467,8 +366,7 @@ public class BollingerBandStrategy implements TradingStrategy {
         double min = recent.stream().min(Double::compare).orElse(0.0);
         double max = recent.stream().max(Double::compare).orElse(1.0);
         double k = (recent.get(recent.size() - 1) - min) / (max - min + 1e-9);
-        double d = recent.stream().skip(Math.max(0, recent.size() - 3))
-                .mapToDouble(Double::doubleValue).average().orElse(k);
+        double d = recent.stream().skip(Math.max(0, recent.size() - 3)).mapToDouble(Double::doubleValue).average().orElse(k);
         return new double[]{k, d};
     }
 
@@ -478,157 +376,6 @@ public class BollingerBandStrategy implements TradingStrategy {
         if (hour >= 9 && hour < 18) return 50_000_000;
         if (hour >= 18 && hour < 22) return 80_000_000;
         return 100_000_000;
-    }
-
-    /* =====================================================
-     * [9] 백테스트 메서드
-     * - 슬리피지, 최소수익률, ATR제한 동일 적용
-     * - 호가창 검증은 제외 (과거 데이터 없음)
-     * ===================================================== */
-    @Override
-    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
-        if (candles.size() < 30) return 0;
-
-        int period = strategyParameterService.getIntParam(getStrategyName(), null, "bollinger.period", PERIOD);
-        double multiplier = strategyParameterService.getDoubleParam(getStrategyName(), null, "bollinger.multiplier", STD_DEV_MULTIPLIER);
-        double stopLossRate = strategyParameterService.getDoubleParam(getStrategyName(), null, "stopLoss.rate", -2.5);
-        double takeProfitRate = strategyParameterService.getDoubleParam(getStrategyName(), null, "takeProfit.rate", 2.0);
-        double volumeThreshold = strategyParameterService.getDoubleParam(getStrategyName(), null, "volume.threshold", 120.0);
-        double rsiOversold = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.oversold", 30.0);
-        double rsiOverbought = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.overbought", 70.0);
-        int rsiPeriod = strategyParameterService.getIntParam(getStrategyName(), null, "rsi.period", 14);
-
-        boolean holding = position != null && position.isHolding();
-
-        double[] bands = indicator.calculateBollingerBands(candles, period, multiplier);
-        double middleBand = bands[0];
-
-        double rsi = calculateRSI(candles, rsiPeriod);
-        double atr = calculateATR(candles, rsiPeriod);
-
-        double[] stoch = calculateStochRSI(candles, rsiPeriod, rsiPeriod);
-        double stochK = stoch[0];
-        double stochD = stoch[1];
-
-        double currentPrice = candles.get(0).getTradePrice().doubleValue();
-
-        double currentVolume = candles.get(0).getCandleAccTradePrice().doubleValue();
-        double avgVolume = candles.subList(1, 6).stream()
-                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
-                .average().orElse(1.0);
-
-        if (holding) {
-            double buyPrice = position.getBuyPrice();
-            double highest = position.getHighestPrice();
-
-            // [6] 실제 체결가 반영 (슬리피지 + 수수료)
-            double realBuyPrice = buyPrice * (1 + TOTAL_COST);
-            double realSellPrice = currentPrice * (1 - TOTAL_COST);
-            double realProfitRate = (realSellPrice - realBuyPrice) / realBuyPrice;
-
-            // [7] ATR 손절 최대값 제한 (-3%)
-            double maxStopLoss = buyPrice * (1 - MAX_STOP_LOSS_RATE);
-            double fixedStopLoss = buyPrice * (1 + stopLossRate / 100);
-            double atrStopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
-
-            // 손절 사유 세분화
-            if (currentPrice <= atrStopLoss && atrStopLoss >= maxStopLoss) {
-                return exit(ExitReason.STOP_LOSS_ATR);
-            }
-            if (currentPrice <= fixedStopLoss && fixedStopLoss >= maxStopLoss) {
-                return exit(ExitReason.STOP_LOSS_FIXED);
-            }
-            if (currentPrice <= maxStopLoss) {
-                return exit(ExitReason.STOP_LOSS_FIXED);  // 최대 손절 도달
-            }
-
-            // 익절 조건
-            double fixedTakeProfit = buyPrice * (1 + takeProfitRate / 100);
-            double atrTakeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
-            double takeProfit = Math.min(fixedTakeProfit, atrTakeProfit);
-
-            // [6] 익절 시 최소 수익률 체크 (0.6% 이상만 익절)
-            if (currentPrice >= takeProfit && rsi > rsiOverbought) {
-                if (realProfitRate >= MIN_PROFIT_RATE) {
-                    return exit(ExitReason.TAKE_PROFIT);
-                }
-                // 최소 수익률 미달 시 익절하지 않음
-            }
-
-            double trailingStop = highest - atr * TRAILING_STOP_ATR_MULT;
-            if (currentPrice <= trailingStop && highest > buyPrice * 1.01) {
-                return exit(ExitReason.TRAILING_STOP);
-            }
-
-            // 추가 청산 조건
-            if (currentVolume < avgVolume * 0.5) {
-                return exit(ExitReason.VOLUME_DROP);
-            }
-
-            if (rsi > 85) {
-                return exit(ExitReason.OVERHEATED);
-            }
-
-            return 0;
-        }
-
-        // 진입 로직
-        // 백테스트는 호가창 데이터 없어 검증 생략
-        double bandWidthPercent = ((bands[1] - bands[2]) / middleBand) * 100;
-        if (bandWidthPercent < 0.8) return 0;
-
-        if (!isHigherLowStructure(candles)) return 0;
-        if (isFakeRebound(candles)) return 0;
-
-        double candleMove = Math.abs(
-                candles.get(0).getTradePrice().doubleValue()
-                        - candles.get(1).getTradePrice().doubleValue()
-        );
-        if (candleMove > atr * 0.8) return 0;
-
-        if (currentVolume < avgVolume * 0.9) return 0;
-        if (rsi > rsiOverbought) return 0;
-
-        // 추세 확인
-        double avgPrice10 = candles.subList(0, 10).stream()
-                .mapToDouble(c -> c.getTradePrice().doubleValue())
-                .average().orElse(currentPrice);
-        if (currentPrice <= avgPrice10 * 0.998) return 0;
-
-        // 거래량 지속성 체크
-        double minSustainedVolume = avgVolume * 0.8;
-        for (int i = 0; i < 3; i++) {
-            double candleVolume = candles.get(i).getCandleAccTradePrice().doubleValue();
-            if (candleVolume < minSustainedVolume) {
-                return 0;
-            }
-        }
-
-        // 진입 시그널
-        boolean stochEntry =
-                stochK > stochD &&
-                        stochK < 0.8 &&
-                        rsi > rsiOversold &&
-                        currentPrice > middleBand * 0.98;
-
-        boolean volumeBreakout =
-                rsi > 45 &&
-                        (currentVolume / avgVolume) * 100 >= volumeThreshold &&
-                        currentPrice > middleBand;
-
-        // 거래대금 필터
-        double minTradeAmount = getMinTradeAmountByTime();
-        double avgTradeAmount = candles.subList(1, 4).stream()
-                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
-                .average().orElse(0);
-
-        if (avgTradeAmount < minTradeAmount * 0.7) return 0;
-
-        if (stochEntry || volumeBreakout) {
-            return 1;
-        }
-
-        return 0;
     }
 
     @Override

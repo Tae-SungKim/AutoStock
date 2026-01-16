@@ -13,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
@@ -23,8 +24,9 @@ import java.util.List;
 @RequiredArgsConstructor
 public class BollingerBandSafeStrategy implements TradingStrategy {
 
-    /* ================= 기본 파라미터 ================= */
-
+    /* =====================================================
+     * 기본 파라미터 (1분봉 기준)
+     * ===================================================== */
     private static final int PERIOD = 20;
     private static final double STD_DEV_MULTIPLIER = 2.0;
 
@@ -35,8 +37,9 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
     private static final double TAKE_PROFIT_ATR_MULT = 2.5;
     private static final double TRAILING_STOP_ATR_MULT = 1.5;
 
-    /* ================= 실거래 안정화 파라미터 ================= */
-
+    /* =====================================================
+     * 실거래 안정화 파라미터
+     * ===================================================== */
     private static final double MAX_ATR_ENTRY_MULT = 0.6;   // 과열 캔들 차단
     private static final double PULLBACK_ATR_MULT = 0.3;    // 눌림 허용
     private static final double MIN_BREAKOUT_ATR = 0.8;
@@ -45,7 +48,17 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
     private final TradeHistoryRepository tradeHistoryRepository;
     private final StrategyParameterService strategyParameterService;
 
-    private Double targetPrice = null;
+    private final ThreadLocal<Double> targetPrice = new ThreadLocal<>();
+
+    @Override
+    public Double getTargetPrice() {
+        return targetPrice.get();
+    }
+
+    @Override
+    public void clearPosition(String market) {
+        targetPrice.remove();
+    }
 
     @Override
     public int analyze(List<Candle> candles) {
@@ -54,7 +67,44 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
 
     @Override
     public int analyze(String market, List<Candle> candles) {
+        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
+                .stream().findFirst().orElse(null);
 
+        boolean holding = latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
+        double buyPrice = holding ? latest.getPrice().doubleValue() : 0;
+        double currentPrice = candles.isEmpty() ? 0 : candles.get(0).getTradePrice().doubleValue();
+        
+        double highestPrice = buyPrice;
+        LocalDateTime buyCreatedAt = LocalDateTime.now();
+        boolean isSell = latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL;
+        LocalDateTime lastTradeAt = latest != null ? latest.getCreatedAt() : LocalDateTime.now();
+
+        if (holding) {
+            highestPrice = latest.getHighestPrice() == null ? currentPrice : latest.getHighestPrice().doubleValue();
+            if (currentPrice > highestPrice) {
+                latest.setHighestPrice(BigDecimal.valueOf(currentPrice));
+                tradeHistoryRepository.save(latest);
+                highestPrice = currentPrice;
+            }
+            buyCreatedAt = latest.getCreatedAt();
+        }
+
+        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, isSell, lastTradeAt);
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        boolean holding = position != null && position.isHolding();
+        double buyPrice = holding ? position.getBuyPrice() : 0;
+        double highestPrice = holding ? position.getHighestPrice() : 0;
+        LocalDateTime buyCreatedAt = (holding && position.getBuyTime() != null) ? position.getBuyTime() : LocalDateTime.now();
+        
+        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, false, LocalDateTime.now());
+    }
+
+    private int analyzeLogic(String market, List<Candle> candles, boolean holding, double buyPrice, 
+                             double highestPrice, LocalDateTime buyCreatedAt, boolean isSell, LocalDateTime lastTradeAt) {
+        
         if (candles.size() < 30) return 0;
 
         int period = strategyParameterService.getIntParam(getStrategyName(), null, "bollinger.period", PERIOD);
@@ -65,11 +115,6 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
         double rsiOversold = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.oversold", 30.0);
         double rsiOverbought = strategyParameterService.getDoubleParam(getStrategyName(), null, "rsi.overbought", 70.0);
         int rsiPeriod = strategyParameterService.getIntParam(getStrategyName(), null, "rsi.period", 14);
-
-        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
-                .stream().findFirst().orElse(null);
-
-        boolean holding = latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
 
         double[] bands = indicator.calculateBollingerBands(candles, period, multiplier);
         double middleBand = bands[0];
@@ -96,16 +141,9 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
          * 1️⃣ 매도 로직
          * ===================================================== */
         if (holding) {
-            double buyPrice = latest.getPrice().doubleValue();
-            double highest = latest.getHighestPrice() == null
-                    ? currentPrice
-                    : latest.getHighestPrice().doubleValue();
-
-            if (currentPrice > highest) {
-                latest.setHighestPrice(BigDecimal.valueOf(currentPrice));
-                tradeHistoryRepository.save(latest);
-                highest = currentPrice;
-            }
+            double realBuyPrice = buyPrice * (1 + 0.002); // TOTAL_COST 대략적인 값
+            double realSellPrice = currentPrice * (1 - 0.002);
+            double realProfitRate = (realSellPrice - realBuyPrice) / realBuyPrice;
 
             double fixedStopLoss = buyPrice * (1 + stopLossRate / 100);
             double atrStopLoss = buyPrice - atr * STOP_LOSS_ATR_MULT;
@@ -115,11 +153,9 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
             double atrTakeProfit = buyPrice + atr * TAKE_PROFIT_ATR_MULT;
             double takeProfit = Math.min(fixedTakeProfit, atrTakeProfit);
 
-            double trailingStop = highest - atr * TRAILING_STOP_ATR_MULT;
+            double trailingStop = highestPrice - atr * TRAILING_STOP_ATR_MULT;
 
-            long holdingMinutes = java.time.Duration
-                    .between(latest.getCreatedAt(), java.time.LocalDateTime.now())
-                    .toMinutes();
+            long holdingMinutes = java.time.Duration.between(buyCreatedAt, LocalDateTime.now()).toMinutes();
 
             if (holdingMinutes >= MIN_HOLD_CANDLES && currentPrice <= stopLoss) {
                 return -1;
@@ -131,20 +167,15 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
 
             if (holdingMinutes >= MIN_HOLD_CANDLES &&
                     currentPrice <= trailingStop &&
-                    highest > buyPrice * 1.015) {
+                    highestPrice > buyPrice * 1.015) {
                 return -1;
             }
 
             return 0;
         }
 
-        /* =====================================================
-         * 2️⃣ 손절 쿨다운
-         * ===================================================== */
-        if (latest != null && latest.getTradeType() == TradeHistory.TradeType.SELL) {
-            long diff = java.time.Duration
-                    .between(latest.getCreatedAt(), java.time.LocalDateTime.now())
-                    .toMinutes();
+        if (isSell) {
+            long diff = java.time.Duration.between(lastTradeAt, LocalDateTime.now()).toMinutes();
             if (diff < STOP_LOSS_COOLDOWN_CANDLES) return 0;
         }
 
@@ -202,12 +233,12 @@ public class BollingerBandSafeStrategy implements TradingStrategy {
          * 6️⃣ 매수 (눌림 확인 후)
          * ===================================================== */
         if ((stochEntry || volumeBreakout) && pullbackConfirmed) {
-            this.targetPrice = currentPrice + atr * 0.2;
+            this.targetPrice.set(currentPrice + atr * 0.2);
             log.info("[{}] 눌림목 매수 진입", market);
             return 1;
         }
 
-        targetPrice = null;
+        targetPrice.remove();
         return 0;
     }
 

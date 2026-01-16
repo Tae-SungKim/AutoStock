@@ -1,7 +1,11 @@
 package autostock.taesung.com.autostock.strategy.impl;
 
+import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
+import autostock.taesung.com.autostock.entity.TradeHistory;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
+import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -16,13 +20,34 @@ import java.util.List;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class VolatilityBreakoutStrategy implements TradingStrategy {
 
+    private final TradeHistoryRepository tradeHistoryRepository;
     private static final double K = 0.5;  // 변동성 계수 (0.4 ~ 0.6 권장)
-    private boolean positionOpen = false;
 
     @Override
     public int analyze(List<Candle> candles) {
+        return analyze("UNKNOWN", candles);
+    }
+
+    @Override
+    public int analyze(String market, List<Candle> candles) {
+        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
+                .stream().findFirst().orElse(null);
+
+        boolean positionOpen = latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
+
+        return analyzeLogic(market, candles, positionOpen);
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        boolean positionOpen = position != null && position.isHolding();
+        return analyzeLogic(market, candles, positionOpen);
+    }
+
+    private int analyzeLogic(String market, List<Candle> candles, boolean positionOpen) {
         try {
             if (candles.size() < 3) {
                 return 0;
@@ -57,14 +82,12 @@ public class VolatilityBreakoutStrategy implements TradingStrategy {
                     log.info("[변동성돌파] 돌파 발생! 목표가: {}, 현재가: {}",
                             String.format("%.0f", targetPrice),
                             String.format("%.0f", currentPrice));
-                    positionOpen = true;
                     return 1;  // 매수
                 }
             }
 
             // 포지션이 있으면 다음 캔들에서 매도 (또는 일정 시간 후)
             if (positionOpen) {
-                positionOpen = false;
                 return -1;  // 매도
             }
 

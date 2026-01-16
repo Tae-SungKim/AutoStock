@@ -4,6 +4,9 @@ import autostock.taesung.com.autostock.backtest.dto.BacktestPosition;
 import autostock.taesung.com.autostock.backtest.dto.ExitReason;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
+import autostock.taesung.com.autostock.entity.TradeHistory;
+import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -24,18 +27,41 @@ import java.util.List;
  */
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class MomentumScalpingStrategy implements TradingStrategy {
+
+    private final TradeHistoryRepository tradeHistoryRepository;
 
     private static final int VOLUME_LOOKBACK = 20;      // 거래량 비교 기간
     private static final double VOLUME_MULTIPLIER = 2.0; // 거래량 배수 조건
     private static final double PRICE_SURGE_RATE = 0.015; // 가격 급등 기준 (1.5%)
     private static final int CONSECUTIVE_BULLISH = 2;    // 연속 양봉 수
 
-    private boolean inPosition = false;
-    private double entryPrice = 0;
-
     @Override
     public int analyze(List<Candle> candles) {
+        return analyze("UNKNOWN", candles);
+    }
+
+    @Override
+    public int analyze(String market, List<Candle> candles) {
+        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
+                .stream().findFirst().orElse(null);
+
+        boolean inPosition = latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
+        double entryPrice = inPosition ? latest.getPrice().doubleValue() : 0;
+
+        return analyzeLogic(market, candles, inPosition, entryPrice);
+    }
+
+    @Override
+    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
+        boolean inPosition = position != null && position.isHolding();
+        double entryPrice = inPosition ? position.getBuyPrice() : 0;
+
+        return analyzeLogic(market, candles, inPosition, entryPrice);
+    }
+
+    private int analyzeLogic(String market, List<Candle> candles, boolean inPosition, double entryPrice) {
         try {
             if (candles.size() < VOLUME_LOOKBACK + 5) {
                 return 0;
@@ -56,8 +82,6 @@ public class MomentumScalpingStrategy implements TradingStrategy {
                 if (profitRate >= 0.025 || profitRate <= -0.015 || isBearish) {
                     log.info("[급등단타] 청산 - 수익률: {}%, 음봉: {}",
                             String.format("%.2f", profitRate * 100), isBearish);
-                    inPosition = false;
-                    entryPrice = 0;
                     return -1;
                 }
                 return 0;
@@ -106,8 +130,6 @@ public class MomentumScalpingStrategy implements TradingStrategy {
                 log.info("[급등단타] 매수 신호 - 거래량 {}배, 상승률 {}%",
                         String.format("%.1f", currentVolume / avgVolume),
                         String.format("%.2f", priceChange * 100));
-                inPosition = true;
-                entryPrice = currentPrice;
                 return 1;
             }
 
@@ -116,29 +138,6 @@ public class MomentumScalpingStrategy implements TradingStrategy {
             log.error("[급등단타] 분석 실패: {}", e.getMessage());
             return 0;
         }
-    }
-
-    @Override
-    public int analyzeForBacktest(String market, List<Candle> candles, BacktestPosition position) {
-        if (candles.size() < VOLUME_LOOKBACK + 5) return 0;
-
-        Candle current = candles.get(0);
-        double currentPrice = current.getTradePrice().doubleValue();
-
-        if (position != null && position.isHolding()) {
-            double buyPrice = position.getBuyPrice();
-            double profitRate = (currentPrice - buyPrice) / buyPrice;
-
-            boolean isBearish = current.getTradePrice().compareTo(current.getOpeningPrice()) < 0;
-
-            if (profitRate >= 0.025) return exit(ExitReason.TAKE_PROFIT);
-            if (profitRate <= -0.015) return exit(ExitReason.STOP_LOSS_FIXED);
-            if (isBearish) return exit(ExitReason.SIGNAL_INVALID); // 상승 추세 꺾임
-
-            return 0;
-        }
-
-        return analyze(market, candles);
     }
 
     @Override

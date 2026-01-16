@@ -5,6 +5,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.time.LocalDateTime;
+
 /**
  * 백테스트용 포지션 정보
  * - 실제 매매에서 DB(TradeHistory)에서 조회하는 정보를 대체
@@ -24,6 +26,11 @@ public class BacktestPosition {
      * 매수 가격
      */
     private Double buyPrice;
+
+    /**
+     * 매수 시간
+     */
+    private LocalDateTime buyTime;
 
     /**
      * 매수 후 최고가 (트레일링 스탑용)
