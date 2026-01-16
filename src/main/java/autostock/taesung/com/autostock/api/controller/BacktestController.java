@@ -296,10 +296,12 @@ public class BacktestController {
     public ResponseEntity<BacktestResult> runBacktestFromDb(
             @RequestParam(defaultValue = "KRW-BTC") String market,
             @RequestParam(defaultValue = "1000000") double initialBalance,
-            @RequestParam(required = false) Integer unit) {
+            @RequestParam(required = false) Integer unit,
+            @RequestParam(required = false) String startDate,
+            @RequestParam(required = false) String endDate) {
 
-        log.info("DB 데이터 기반 백테스팅 요청 - 마켓: {}", market);
-        BacktestResult result = backtestService.runBacktestFromDb(market, initialBalance, unit);
+        log.info("DB 데이터 기반 백테스팅 요청 - 마켓: {}, 기간: {} ~ {}", market, startDate, endDate);
+        BacktestResult result = backtestService.runBacktestFromDb(market, initialBalance, unit, startDate, endDate);
         return ResponseEntity.ok(result);
     }
 
@@ -310,10 +312,12 @@ public class BacktestController {
     public ResponseEntity<BacktestResult> runRealTradingSimulationFromDb(
             @RequestParam(defaultValue = "KRW-BTC") String market,
             @RequestParam(defaultValue = "1000000") double initialBalance,
-            @RequestParam(required = false) Integer unit) {
+            @RequestParam(required = false) Integer unit,
+            @RequestParam(required = false) String startDate,
+            @RequestParam(required = false) String endDate) {
 
-        log.info("DB 데이터 기반 실제 매매 시뮬레이션 요청 - 마켓: {}", market);
-        BacktestResult result = backtestService.runRealTradingSimulationFromDb(market, initialBalance, unit);
+        log.info("DB 데이터 기반 실제 매매 시뮬레이션 요청 - 마켓: {}, 기간: {} ~ {}", market, startDate, endDate);
+        BacktestResult result = backtestService.runRealTradingSimulationFromDb(market, initialBalance, unit, startDate, endDate);
         return ResponseEntity.ok(result);
     }
 
@@ -327,10 +331,12 @@ public class BacktestController {
             @PathVariable String strategy,
             @RequestParam(defaultValue = "KRW-BTC") String market,
             @RequestParam(defaultValue = "1000000") double initialBalance,
-            @RequestParam(required = false) Integer unit) {
+            @RequestParam(required = false) Integer unit,
+            @RequestParam(required = false) String startDate,
+            @RequestParam(required = false) String endDate) {
 
-        log.info("DB 데이터 기반 {} 전략 백테스팅 요청 - 마켓: {}", strategy, market);
-        BacktestResult result = backtestService.runBacktestWithStrategyFromDb(market, strategy, initialBalance, unit);
+        log.info("DB 데이터 기반 {} 전략 백테스팅 요청 - 마켓: {}, 기간: {} ~ {}", strategy, market, startDate, endDate);
+        BacktestResult result = backtestService.runBacktestWithStrategyFromDb(market, strategy, initialBalance, unit, startDate, endDate);
         return ResponseEntity.ok(result);
     }
 
@@ -345,13 +351,16 @@ public class BacktestController {
             @RequestParam(defaultValue = "KRW-BTC,KRW-ETH,KRW-XRP") String markets,
             @RequestParam(required = false) String strategy,
             @RequestParam(defaultValue = "1000000") double initialBalancePerMarket,
-            @RequestParam(required = false) Integer unit) {
+            @RequestParam(required = false) Integer unit,
+            @RequestParam(required = false) String startDate,
+            @RequestParam(required = false) String endDate) {
 
         List<String> marketList = Arrays.asList(markets.split(","));
-        log.info("DB 데이터 기반 멀티 코인 백테스팅 요청 - {}개 마켓, 전략: {}", marketList.size(), strategy);
+        log.info("DB 데이터 기반 멀티 코인 백테스팅 요청 - {}개 마켓, 전략: {}, 기간: {} ~ {}", 
+                marketList.size(), strategy, startDate, endDate);
 
         MultiCoinBacktestResult result = backtestService.runMultiCoinBacktestFromDb(
-                marketList, strategy, initialBalancePerMarket, unit);
+                marketList, strategy, initialBalancePerMarket, unit, startDate, endDate);
         return ResponseEntity.ok(result);
     }
 
