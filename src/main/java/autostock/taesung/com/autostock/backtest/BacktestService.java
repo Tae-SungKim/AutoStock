@@ -53,7 +53,7 @@ public class BacktestService {
      * 특정 전략으로 백테스팅 실행
      */
     public BacktestResult runBacktestWithStrategy(String market, String strategyName,
-                                                   double initialBalance, int candleUnit, int candleCount) {
+                                                  double initialBalance, int candleUnit, int candleCount) {
         log.info("========== {} 전략 백테스팅 시작 ==========", strategyName);
 
         List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
@@ -71,7 +71,7 @@ public class BacktestService {
      * 모든 전략 개별 백테스팅 결과 반환
      */
     public List<BacktestResult> runAllStrategiesBacktest(String market, double initialBalance,
-                                                          int candleUnit, int candleCount) {
+                                                         int candleUnit, int candleCount) {
         List<Candle> candles = upbitApiService.getMinuteCandles(market, candleUnit, candleCount);
         Collections.reverse(candles);
 
@@ -97,7 +97,7 @@ public class BacktestService {
      * @param initialBalancePerMarket 마켓당 초기 자본금
      */
     public MultiCoinBacktestResult runMultiCoinBacktest(List<String> markets, String strategyName,
-                                                         double initialBalancePerMarket, int candleUnit, int candleCount) {
+                                                        double initialBalancePerMarket, int candleUnit, int candleCount) {
         log.info("========== 멀티 코인 백테스팅 시작 ==========");
         log.info("마켓 수: {}, 전략: {}, 마켓당 자본: {}", markets.size(), strategyName, initialBalancePerMarket);
 
@@ -233,7 +233,7 @@ public class BacktestService {
      * - 손절/익절 로직 포함
      */
     public BacktestResult runRealTradingSimulation(String market, double initialBalance,
-                                                    int candleUnit, int candleCount) {
+                                                   int candleUnit, int candleCount) {
         log.info("========== 실제 매매 시뮬레이션 시작 ==========");
         log.info("마켓: {}, 초기자본: {}, 전략 수: {}", market, initialBalance, strategies.size());
         log.info("과반수 기준: {}개 이상 동의 시 매매", (strategies.size() / 2) + 1);
@@ -248,9 +248,9 @@ public class BacktestService {
      * 멀티 코인 실제 매매 시뮬레이션
      */
     public MultiCoinBacktestResult runMultiCoinRealTradingSimulation(List<String> markets,
-                                                                      String strategyName,
-                                                                      double initialBalancePerMarket,
-                                                                      int candleUnit, int candleCount) {
+                                                                     String strategyName,
+                                                                     double initialBalancePerMarket,
+                                                                     int candleUnit, int candleCount) {
         log.info("========== 멀티 코인 실제 매매 시뮬레이션 시작 ==========");
         log.info("마켓 수: {}, 전략 수: {}, 과반수: {}개",
                 markets.size(), strategies.size(), (strategies.size() / 2) + 1);
@@ -699,7 +699,7 @@ public class BacktestService {
      * - analyzeForBacktest를 호출하여 실제 매매와 동일한 로직으로 시뮬레이션
      */
     private BacktestResult executeBacktestSingleStrategy(String market, TradingStrategy strategy,
-                                                          List<Candle> candles, double initialBalance) {
+                                                         List<Candle> candles, double initialBalance) {
         double krwBalance = initialBalance;
         double coinBalance = 0;
         double lastBuyPrice = 0;
@@ -787,7 +787,7 @@ public class BacktestService {
                     double profitRate = (currentPrice - lastBuyPrice) / lastBuyPrice;
                     exitReason = profitRate > 0 ? ExitReason.TAKE_PROFIT : ExitReason.STOP_LOSS_FIXED;
                 }
-                
+
                 // 통계 업데이트
                 exitReasonStats.put(exitReason, exitReasonStats.getOrDefault(exitReason, 0) + 1);
 
@@ -849,8 +849,8 @@ public class BacktestService {
 
         // 통계 출력
         System.out.println("\n===== Exit Reason Statistics =====");
-        exitReasonStats.forEach((reason, count) -> 
-            System.out.printf("%-17s : %d\n", reason, count));
+        exitReasonStats.forEach((reason, count) ->
+                System.out.printf("%-17s : %d\n", reason, count));
         System.out.println("==================================\n");
 
         log.info("[{}] {} 전략 - 수익률: {}%, 단순보유: {}%, 거래: {}회, 승률: {}%",
@@ -951,7 +951,7 @@ public class BacktestService {
      * DB 데이터를 사용한 단일 전략 백테스팅
      */
     public BacktestResult runBacktestWithStrategyFromDb(String market, String strategyName,
-                                                         double initialBalance, Integer unit) {
+                                                        double initialBalance, Integer unit) {
         log.info("========== DB 데이터 기반 {} 전략 백테스팅 시작 ==========", strategyName);
 
         List<CandleData> candleDataList;
@@ -980,7 +980,7 @@ public class BacktestService {
      * DB 데이터를 사용한 멀티 코인 단일 전략 백테스팅
      */
     public MultiCoinBacktestResult runMultiCoinBacktestFromDb(List<String> markets, String strategyName,
-                                                               double initialBalancePerMarket, Integer unit) {
+                                                              double initialBalancePerMarket, Integer unit) {
         log.info("========== DB 데이터 기반 멀티 코인 백테스팅 시작 ==========");
         log.info("마켓 수: {}, 전략: {}, 마켓당 자본: {}", markets.size(), strategyName, initialBalancePerMarket);
 
@@ -995,11 +995,9 @@ public class BacktestService {
                     .orElse(null);
         }
 
-        final TradingStrategy finalSelectedStrategy = selectedStrategy;
-        List<BacktestResult> results = markets.parallelStream()
-                .map(market -> {
-                    try {
-                        log.info("DB 백테스팅 진행 중: {}", market);
+        for (String market : markets) {
+            try {
+                log.info("DB 백테스팅 진행 중: {}", market);
 
                 List<CandleData> candleDataList;
                 if (unit != null) {
