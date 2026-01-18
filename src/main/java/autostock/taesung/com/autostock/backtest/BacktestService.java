@@ -12,6 +12,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -759,6 +760,7 @@ public class BacktestService {
 
                 // 포지션 업데이트
                 position = BacktestPosition.buy(currentPrice, volume, targetPrice);
+                position.setBuyTime(LocalDateTime.parse(currentCandle.getCandleDateTimeKst()));
 
                 double totalAsset = krwBalance + (coinBalance * currentPrice);
 

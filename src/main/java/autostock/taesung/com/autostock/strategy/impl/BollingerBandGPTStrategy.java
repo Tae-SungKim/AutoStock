@@ -22,27 +22,32 @@ import java.util.List;
 public class BollingerBandGPTStrategy implements TradingStrategy {
 
     /* ==========================
-     * 파라미터
+     * 1분봉 최적화 파라미터
      * ========================== */
     private static final int BB_PERIOD = 20;
     private static final double BB_MULT = 2.0;
 
     private static final int RSI_PERIOD = 7;
-    private static final int ATR_PERIOD = 10;
+    private static final int ATR_PERIOD = 14;
 
-    private static final double STOP_LOSS_ATR_MULT = 2.5;
-    private static final double TAKE_PROFIT_ATR_MULT = 1.8;
+    // 🔥 1분봉 전용 (과도한 손실 방지)
+    // 일반
+    /*private static final double STOP_LOSS_ATR_MULT = 1.2;
+    private static final double TAKE_PROFIT_ATR_MULT = 1.5;
 
-    private static final int MIN_HOLD_MINUTES = 2;
+    private static final int MIN_HOLD_MINUTES = 1;*/
+
+    // 스켈핑형
+    private static final double STOP_LOSS_ATR_MULT = 1.0;
+    private static final double TAKE_PROFIT_ATR_MULT = 3.0;
+
+    private static final int MIN_HOLD_MINUTES = 1;
 
     /* ==========================
      * 업비트 수수료
      * ========================== */
-    private static final double FEE_RATE = 0.0005; // 0.05%
+    private static final double FEE_RATE = 0.0005;
 
-    /* ==========================
-     * 의존성
-     * ========================== */
     private final TechnicalIndicator indicator;
     private final TradeHistoryRepository tradeHistoryRepository;
     private final UpbitApiService upbitApiService;
@@ -52,7 +57,6 @@ public class BollingerBandGPTStrategy implements TradingStrategy {
         return analyze("UNKNOWN", candles);
     }
 
-    /* ========================================================= */
     @Override
     public int analyze(String market, List<Candle> candles) {
         TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
@@ -63,7 +67,6 @@ public class BollingerBandGPTStrategy implements TradingStrategy {
         LocalDateTime buyTime = holding ? latest.getCreatedAt() : null;
 
         LocalDateTime candleTime = parseCandleTime(candles.get(0).getCandleDateTimeKst());
-
         return analyzeCore(market, candles, holding, buyPrice, buyTime, candleTime, false);
     }
 
@@ -74,13 +77,9 @@ public class BollingerBandGPTStrategy implements TradingStrategy {
         LocalDateTime buyTime = holding ? position.getBuyTime() : null;
 
         LocalDateTime candleTime = parseCandleTime(candles.get(0).getCandleDateTimeKst());
-
         return analyzeCore(market, candles, holding, buyPrice, buyTime, candleTime, true);
     }
 
-    /* =========================================================
-     * 핵심 로직
-     * ========================================================= */
     private int analyzeCore(
             String market,
             List<Candle> candles,
@@ -92,82 +91,76 @@ public class BollingerBandGPTStrategy implements TradingStrategy {
     ) {
         if (candles.size() < 30) return 0;
 
-        double currentPrice = candles.get(0).getTradePrice().doubleValue();
-
+        double price = candles.get(0).getTradePrice().doubleValue();
         double rsi = calculateRSI(candles, RSI_PERIOD);
         double atr = calculateATR(candles, ATR_PERIOD);
 
-        double[] bands = indicator.calculateBollingerBands(candles, BB_PERIOD, BB_MULT);
-        double middleBand = bands[0];
-        double bandWidthPct = (bands[1] - bands[2]) / middleBand * 100;
+        double[] bb = indicator.calculateBollingerBands(candles, BB_PERIOD, BB_MULT);
+        double middle = bb[0];
 
         /* ==========================
-         * 매도 로직 (수수료 반영)
+         * 매도
          * ========================== */
         if (holding) {
-            long holdingMinutes = Duration.between(buyTime, candleTime).toMinutes();
+            long holdMin = Duration.between(buyTime, candleTime).toMinutes();
 
-            double realBuyPrice = buyPrice * (1 + FEE_RATE);
-            double realSellPrice = currentPrice * (1 - FEE_RATE);
+            double sell = price * (1 - FEE_RATE);
+            double stop = (buyPrice - atr * STOP_LOSS_ATR_MULT) * (1 - FEE_RATE);
+            double take = (buyPrice + atr * TAKE_PROFIT_ATR_MULT) * (1 - FEE_RATE);
 
-            double stopLossPrice =
-                    (buyPrice - atr * STOP_LOSS_ATR_MULT) * (1 - FEE_RATE);
-            double takeProfitPrice =
-                    (buyPrice + atr * TAKE_PROFIT_ATR_MULT) * (1 - FEE_RATE);
-
-            if (holdingMinutes >= MIN_HOLD_MINUTES) {
-                if (realSellPrice <= stopLossPrice) return -1;
-                if (realSellPrice >= takeProfitPrice) return -1;
+            if (holdMin >= MIN_HOLD_MINUTES) {
+                if (sell <= stop) return -1;
+                if (sell >= take) return -1;
             }
             return 0;
         }
 
         /* ==========================
-         * 진입 조건
+         * 진입 (1분봉 전용)
          * ========================== */
-        if (bandWidthPct < 0.7) return 0;
-        if (!isHigherLowStructure(candles)) return 0;
-        if (rsi > 65) return 0;
-        if (currentPrice < middleBand * 0.995) return 0;
 
-        /* ==========================
-         * 실거래 전용 호가 검증
-         * ========================== */
-        if (!backtest) {
-            if (!validateOrderbook(market)) return 0;
-        }
+        // RSI 과매도 → 반등
+        // 일반
+        /*if (!(rsi < 30 && calculateRSI(candles.subList(1, candles.size()), RSI_PERIOD) < rsi))
+            return 0;
 
+        // 중단선 돌파 + 유지
+        if (price < middle) return 0;
+
+        // 고점 갱신 구조
+        if (candles.get(0).getHighPrice().doubleValue()
+                <= candles.get(1).getHighPrice().doubleValue())
+            return 0;
+
+        if (!backtest && !validateOrderbook(market)) return 0;*/
+        // 스캘핑 진입
+        double bandWidth = (bb[1] - bb[2]) / bb[0] * 100;
+
+// 밴드 수축
+        if (bandWidth > 0.6) return 0;
+
+// 거래량 폭발
+        double vol0 = candles.get(0).getCandleAccTradeVolume().doubleValue();
+        double vol1 = candles.get(1).getCandleAccTradeVolume().doubleValue();
+        if (vol0 < vol1 * 2.0) return 0;
+
+// 상단 돌파
+        if (price <= bb[1]) return 0;
         return 1;
     }
 
-    /* ==========================
-     * 시간 파싱 (String → LocalDateTime)
-     * ========================== */
     private LocalDateTime parseCandleTime(String candleTimeKst) {
         return LocalDateTime.parse(candleTimeKst);
     }
 
-    /* ==========================
-     * 보조 메서드
-     * ========================== */
     private boolean validateOrderbook(String market) {
         try {
             Orderbook ob = upbitApiService.getOrderbook(market);
-            if (ob == null) return false;
-
-            double bid = ob.getBidPrice(0);
-            double ask = ob.getAskPrice(0);
-            double spread = (ask - bid) / bid;
-
-            return spread <= 0.003;
+            double spread = (ob.getAskPrice(0) - ob.getBidPrice(0)) / ob.getBidPrice(0);
+            return spread <= 0.0025;
         } catch (Exception e) {
             return false;
         }
-    }
-
-    private boolean isHigherLowStructure(List<Candle> candles) {
-        return candles.get(0).getLowPrice().doubleValue()
-                > candles.get(1).getLowPrice().doubleValue();
     }
 
     private double calculateRSI(List<Candle> candles, int period) {
@@ -179,8 +172,7 @@ public class BollingerBandGPTStrategy implements TradingStrategy {
             else loss -= diff;
         }
         if (loss == 0) return 100;
-        double rs = gain / loss;
-        return 100 - (100 / (1 + rs));
+        return 100 - (100 / (1 + gain / loss));
     }
 
     private double calculateATR(List<Candle> candles, int period) {
@@ -189,8 +181,7 @@ public class BollingerBandGPTStrategy implements TradingStrategy {
             double h = candles.get(i).getHighPrice().doubleValue();
             double l = candles.get(i).getLowPrice().doubleValue();
             double pc = candles.get(i + 1).getTradePrice().doubleValue();
-            sum += Math.max(h - l,
-                    Math.max(Math.abs(h - pc), Math.abs(l - pc)));
+            sum += Math.max(h - l, Math.max(Math.abs(h - pc), Math.abs(l - pc)));
         }
         return sum / period;
     }
