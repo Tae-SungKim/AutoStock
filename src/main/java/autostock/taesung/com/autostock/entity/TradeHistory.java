@@ -116,6 +116,42 @@ public class TradeHistory {
     private Boolean halfSold;   // 부분 익절 여부
 
     private Boolean isStopLoss;
+
+    /**
+     * 진입 단계 (1차, 2차, 3차 분할매수)
+     */
+    @Column(name = "entry_phase")
+    private Integer entryPhase;
+
+    /**
+     * 청산 단계 (1차 부분익절, 2차 전량청산)
+     */
+    @Column(name = "exit_phase")
+    private Integer exitPhase;
+
+    /**
+     * 트레일링 스탑 활성화 여부
+     */
+    @Column(name = "trailing_active")
+    private Boolean trailingActive;
+
+    /**
+     * 트레일링 스탑가
+     */
+    @Column(name = "trailing_stop_price", precision = 20, scale = 8)
+    private BigDecimal trailingStopPrice;
+
+    /**
+     * 평균 매수가 (분할매수 시 가중평균)
+     */
+    @Column(name = "avg_entry_price", precision = 20, scale = 8)
+    private BigDecimal avgEntryPrice;
+
+    /**
+     * 총 투자금액
+     */
+    @Column(name = "total_invested", precision = 20, scale = 8)
+    private BigDecimal totalInvested;
     /**
      * 생성 일시
      */

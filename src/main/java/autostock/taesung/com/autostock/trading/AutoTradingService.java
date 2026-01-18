@@ -24,12 +24,17 @@ import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -90,6 +95,35 @@ public class AutoTradingService {
     @Value("${trading.strategy-mode:DEFAULT}")
     private String strategyMode;
 
+    // ===== 주문 타입 설정 =====
+    // 주문 타입 (MARKET: 시장가, LIMIT: 지정가)
+    @Value("${trading.order-type:MARKET}")
+    private String orderType;
+
+    // 지정가 매수 시 가격 오프셋 (현재가 대비 %, 양수면 높게)
+    @Value("${trading.limit-order.buy-offset:0.001}")
+    private double limitBuyOffset;
+
+    // 지정가 매도 시 가격 오프셋 (현재가 대비 %, 양수면 낮게)
+    @Value("${trading.limit-order.sell-offset:0.001}")
+    private double limitSellOffset;
+
+    // 지정가 주문 체결 대기 시간 (초)
+    @Value("${trading.limit-order.timeout-seconds:30}")
+    private int limitOrderTimeout;
+
+    // 지정가 주문 체결 확인 간격 (초)
+    @Value("${trading.limit-order.poll-interval-seconds:2}")
+    private int limitOrderPollInterval;
+
+    // 미체결 시 재시도 횟수
+    @Value("${trading.limit-order.retry-count:2}")
+    private int limitOrderRetryCount;
+
+    // 재시도 시 가격 조정률 (더 유리한 가격으로)
+    @Value("${trading.limit-order.retry-price-adjust:0.002}")
+    private double limitOrderRetryPriceAdjust;
+
     private final int minuteInterval = 1;
     private final int candleCount = 200;
 
@@ -98,6 +132,16 @@ public class AutoTradingService {
 
     private List<String> targetMarkets = new ArrayList<>();
     private List<String> excludedMarkets = new ArrayList<>();
+
+    // ===== 리스크 관리용 변수 =====
+    // 일일 손실 추적 (userId -> 손실금액)
+    private final Map<Long, BigDecimal> dailyLossMap = new ConcurrentHashMap<>();
+    // 일일 거래 횟수 추적
+    private final Map<Long, Integer> dailyTradeCountMap = new ConcurrentHashMap<>();
+    // 연속 손실 횟수
+    private final Map<Long, Integer> consecutiveLossMap = new ConcurrentHashMap<>();
+    // 쿨다운 상태 (userId -> 쿨다운 종료 시간)
+    private final Map<Long, LocalDateTime> cooldownMap = new ConcurrentHashMap<>();
 
     @PostConstruct
     public void init() {
@@ -360,7 +404,7 @@ public class AutoTradingService {
     }
 
     /**
-     * 기본 매매 모드 (다수결 전략)
+     * 기본 매매 모드 (다수결 전략 + 분할매도 + 리스크 관리)
      */
     private void executeDefaultTradingForMarket(User user, String market, List<Candle> candles, double currentPrice) {
         int buySignals = 0;
@@ -393,15 +437,826 @@ public class AutoTradingService {
 
         int threshold = (strategies.size() / 2) + 1;
 
-        if (buySignals >= threshold) {
-            log.info("[{}] 매수 신호! 동의 전략: {}, 목표가: {}", market, buyStrategies,
-                    targetPrice != null ? String.format("%.0f", targetPrice) : "없음");
-            executeBuyForMarket(user, market, currentPrice, String.join(", ", buyStrategies), targetPrice);
-        } else if (sellSignals >= threshold) {
-            log.info("[{}] 매도 신호! 동의 전략: {}", market, sellStrategies);
-            executeSellForMarket(user, market, currentPrice, String.join(", ", sellStrategies));
+        // 보유 포지션 체크 (분할매도/트레일링 스탑 적용)
+        TradeHistory latestBuy = tradeHistoryRepository.findLatestByMarket(market)
+                .stream()
+                .filter(h -> h.getTradeType() == TradeType.BUY)
+                .findFirst().orElse(null);
+
+        boolean isHolding = latestBuy != null && !isPositionFullyClosed(market, latestBuy);
+
+        if (isHolding) {
+            // 보유 중인 경우: 분할매도 로직 적용
+            executeScaledExitLogic(user, market, currentPrice, latestBuy, sellSignals >= threshold,
+                    String.join(", ", sellStrategies), candles);
+        } else if (buySignals >= threshold) {
+            // 리스크 체크 후 매수
+            if (checkRiskBeforeEntry(user, market)) {
+                log.info("[{}] 매수 신호! 동의 전략: {}, 목표가: {}", market, buyStrategies,
+                        targetPrice != null ? String.format("%.0f", targetPrice) : "없음");
+                executeBuyWithScaledEntry(user, market, currentPrice, String.join(", ", buyStrategies), targetPrice, candles);
+            } else {
+                log.warn("[{}] 리스크 한도 초과로 매수 보류", market);
+            }
         } else {
             log.info("[{}] 관망 - 매매 조건 미충족", market);
+        }
+    }
+
+    /**
+     * 포지션이 완전히 청산되었는지 확인
+     */
+    private boolean isPositionFullyClosed(String market, TradeHistory buyHistory) {
+        // 매수 이후 전량 매도가 있었는지 확인
+        List<TradeHistory> sellsAfterBuy = tradeHistoryRepository.findLatestByMarket(market)
+                .stream()
+                .filter(h -> h.getTradeType() == TradeType.SELL)
+                .filter(h -> h.getCreatedAt().isAfter(buyHistory.getCreatedAt()))
+                .toList();
+
+        if (sellsAfterBuy.isEmpty()) {
+            return false;
+        }
+
+        // exitPhase가 2 (전량청산)인 매도가 있으면 포지션 종료
+        return sellsAfterBuy.stream()
+                .anyMatch(h -> h.getExitPhase() != null && h.getExitPhase() >= 2);
+    }
+
+    /**
+     * 분할매도 로직 실행
+     */
+    private void executeScaledExitLogic(User user, String market, double currentPrice,
+                                         TradeHistory buyHistory, boolean hasSellSignal,
+                                         String sellStrategies, List<Candle> candles) {
+        double buyPrice = buyHistory.getAvgEntryPrice() != null
+                ? buyHistory.getAvgEntryPrice().doubleValue()
+                : buyHistory.getPrice().doubleValue();
+        double highestPrice = buyHistory.getHighestPrice() != null
+                ? buyHistory.getHighestPrice().doubleValue()
+                : currentPrice;
+
+        // 최고가 갱신
+        if (currentPrice > highestPrice) {
+            buyHistory.setHighestPrice(BigDecimal.valueOf(currentPrice));
+            tradeHistoryRepository.save(buyHistory);
+            highestPrice = currentPrice;
+        }
+
+        double profitRate = (currentPrice - buyPrice) / buyPrice;
+        boolean halfSold = buyHistory.getHalfSold() != null && buyHistory.getHalfSold();
+        boolean trailingActive = buyHistory.getTrailingActive() != null && buyHistory.getTrailingActive();
+
+        double atr = calculateATR(candles, 14);
+
+        log.info("[{}] 분할매도 체크 - 매수가: {}, 현재가: {}, 수익률: {}%, 1차익절완료: {}, 트레일링: {}",
+                market, String.format("%.0f", buyPrice), String.format("%.0f", currentPrice),
+                String.format("%.2f", profitRate * 100), halfSold, trailingActive);
+
+        // 1. 손절 체크 (최우선)
+        double stopLossPrice = buyPrice * (1 + realTradingConfig.getMaxStopLossRate());
+        if (currentPrice <= stopLossPrice) {
+            log.warn("[{}] 손절 실행! 현재가 {} <= 손절가 {}", market,
+                    String.format("%.0f", currentPrice), String.format("%.0f", stopLossPrice));
+            executeFullExit(user, market, currentPrice, "손절", 2);
+            recordLoss(user.getId(), buyHistory, currentPrice);
+            return;
+        }
+
+        // 2. 1차 익절 (50%) - 아직 안 했으면
+        if (!halfSold && profitRate >= realTradingConfig.getPartialTakeProfitRate()) {
+            log.info("[{}] 1차 익절 실행! 수익률 {}% >= {}%", market,
+                    String.format("%.2f", profitRate * 100),
+                    String.format("%.1f", realTradingConfig.getPartialTakeProfitRate() * 100));
+            executePartialExit(user, market, currentPrice, "1차익절", realTradingConfig.getPartialExitRatio());
+
+            // 1차 익절 완료 표시
+            buyHistory.setHalfSold(true);
+            buyHistory.setExitPhase(1);
+            tradeHistoryRepository.save(buyHistory);
+            return;
+        }
+
+        // 3. 트레일링 스탑 활성화 체크
+        if (halfSold && !trailingActive && profitRate >= realTradingConfig.getTrailingActivationThreshold()) {
+            double trailingStopPrice = calculateTrailingStopPrice(highestPrice, atr);
+            buyHistory.setTrailingActive(true);
+            buyHistory.setTrailingStopPrice(BigDecimal.valueOf(trailingStopPrice));
+            tradeHistoryRepository.save(buyHistory);
+            log.info("[{}] 트레일링 스탑 활성화! 고점: {}, 스탑가: {}", market,
+                    String.format("%.0f", highestPrice), String.format("%.0f", trailingStopPrice));
+        }
+
+        // 4. 트레일링 스탑 체크 및 실행
+        if (trailingActive) {
+            double trailingStopPrice = buyHistory.getTrailingStopPrice() != null
+                    ? buyHistory.getTrailingStopPrice().doubleValue()
+                    : calculateTrailingStopPrice(highestPrice, atr);
+
+            // 고점 갱신 시 트레일링 스탑가도 갱신
+            if (currentPrice > highestPrice) {
+                trailingStopPrice = calculateTrailingStopPrice(currentPrice, atr);
+                buyHistory.setTrailingStopPrice(BigDecimal.valueOf(trailingStopPrice));
+                tradeHistoryRepository.save(buyHistory);
+            }
+
+            if (currentPrice <= trailingStopPrice) {
+                log.info("[{}] 트레일링 스탑 실행! 현재가 {} <= 스탑가 {}", market,
+                        String.format("%.0f", currentPrice), String.format("%.0f", trailingStopPrice));
+                executeFullExit(user, market, currentPrice, "트레일링스탑", 2);
+                recordProfit(user.getId(), buyHistory, currentPrice);
+                return;
+            }
+        }
+
+        // 5. 매도 신호에 의한 청산 (1차 익절 완료 후)
+        if (halfSold && hasSellSignal) {
+            log.info("[{}] 전략 신호에 의한 전량 청산! 전략: {}", market, sellStrategies);
+            executeFullExit(user, market, currentPrice, "신호청산_" + sellStrategies, 2);
+            if (profitRate > 0) {
+                recordProfit(user.getId(), buyHistory, currentPrice);
+            } else {
+                recordLoss(user.getId(), buyHistory, currentPrice);
+            }
+        }
+    }
+
+    /**
+     * 트레일링 스탑가 계산
+     */
+    private double calculateTrailingStopPrice(double highPrice, double atr) {
+        double atrDistance = atr * realTradingConfig.getTrailingAtrMultiplier();
+        double minDistance = highPrice * realTradingConfig.getTrailingStopRate();
+        double distance = Math.max(atrDistance, minDistance);
+        return highPrice - distance;
+    }
+
+    /**
+     * ATR 계산
+     */
+    private double calculateATR(List<Candle> candles, int period) {
+        if (candles.size() < period + 1) return 0;
+        double sumTR = 0;
+        for (int i = 0; i < period; i++) {
+            double high = candles.get(i).getHighPrice().doubleValue();
+            double low = candles.get(i).getLowPrice().doubleValue();
+            double prevClose = candles.get(i + 1).getTradePrice().doubleValue();
+            double tr = Math.max(high - low,
+                    Math.max(Math.abs(high - prevClose), Math.abs(low - prevClose)));
+            sumTR += tr;
+        }
+        return sumTR / period;
+    }
+
+    /**
+     * 부분 청산 실행 (분할매도) - 지정가/시장가 지원
+     */
+    private void executePartialExit(User user, String market, double currentPrice, String reason, double exitRatio) {
+        try {
+            String currency = market.split("-")[1];
+            double coinBalance = upbitApiService.getCoinBalance(user, currency);
+
+            if (coinBalance <= 0) {
+                log.warn("[{}] 매도할 코인이 없습니다.", market);
+                return;
+            }
+
+            double sellAmount = coinBalance * exitRatio;
+            double sellValue = sellAmount * currentPrice;
+
+            if (sellValue < 5000) {
+                log.warn("[{}] 부분 청산 금액이 최소 주문 금액 미만. 스킵.", market);
+                return;
+            }
+
+            // 주문 실행 (시장가 또는 지정가)
+            OrderResult orderResult = executeSellOrder(user, market, sellAmount, currentPrice);
+
+            if (!orderResult.isSuccess()) {
+                log.error("[{}] 부분 매도 실패: {}", market, orderResult.getErrorMessage());
+                return;
+            }
+
+            log.info("[{}] 부분 매도 완료! UUID: {}, 청산비율: {}%, 수량: {}, 체결가: {}, 주문타입: {}",
+                    market, orderResult.getUuid(),
+                    String.format("%.0f", exitRatio * 100),
+                    String.format("%.8f", orderResult.getExecutedVolume()),
+                    String.format("%.0f", orderResult.getExecutedPrice()),
+                    orderResult.getOrderType());
+
+            double actualSellValue = orderResult.getExecutedPrice() * orderResult.getExecutedVolume();
+            saveTradeHistoryWithPhase(market, TradeType.SELL, actualSellValue, orderResult.getExecutedPrice(),
+                    orderResult.getUuid(), reason + "_" + orderResult.getOrderType(), null, 1);
+
+        } catch (Exception e) {
+            log.error("[{}] 부분 매도 실행 실패: {}", market, e.getMessage());
+        }
+    }
+
+    /**
+     * 전량 청산 실행 - 지정가/시장가 지원
+     */
+    private void executeFullExit(User user, String market, double currentPrice, String reason, int exitPhase) {
+        try {
+            String currency = market.split("-")[1];
+            double coinBalance = upbitApiService.getCoinBalance(user, currency);
+
+            if (coinBalance <= 0) {
+                log.warn("[{}] 매도할 코인이 없습니다.", market);
+                return;
+            }
+
+            double sellValue = coinBalance * currentPrice;
+            if (sellValue < 5000) {
+                log.warn("[{}] 청산 금액이 최소 주문 금액 미만.", market);
+                return;
+            }
+
+            // 손절인 경우 시장가로 빠르게 처리
+            boolean isUrgent = reason.contains("손절") || reason.contains("StopLoss");
+            OrderResult orderResult;
+
+            if (isUrgent) {
+                log.info("[{}] 긴급 청산 - 시장가로 처리", market);
+                orderResult = executeMarketSellOrder(user, market, coinBalance, currentPrice);
+            } else {
+                orderResult = executeSellOrder(user, market, coinBalance, currentPrice);
+            }
+
+            if (!orderResult.isSuccess()) {
+                log.error("[{}] 전량 매도 실패: {}", market, orderResult.getErrorMessage());
+                return;
+            }
+
+            log.info("[{}] 전량 매도 완료! UUID: {}, 수량: {}, 체결가: {}, 사유: {}, 주문타입: {}",
+                    market, orderResult.getUuid(),
+                    String.format("%.8f", orderResult.getExecutedVolume()),
+                    String.format("%.0f", orderResult.getExecutedPrice()),
+                    reason, orderResult.getOrderType());
+
+            double actualSellValue = orderResult.getExecutedPrice() * orderResult.getExecutedVolume();
+            saveTradeHistoryWithPhase(market, TradeType.SELL, actualSellValue, orderResult.getExecutedPrice(),
+                    orderResult.getUuid(), reason + "_" + orderResult.getOrderType(), null, exitPhase);
+
+            // 전략별 포지션 청산
+            for (TradingStrategy strategy : strategies) {
+                strategy.clearPosition(market);
+            }
+
+        } catch (Exception e) {
+            log.error("[{}] 전량 매도 실행 실패: {}", market, e.getMessage());
+        }
+    }
+
+    /**
+     * 리스크 체크 (매수 전)
+     */
+    private boolean checkRiskBeforeEntry(User user, String market) {
+        Long userId = user.getId();
+
+        // 1. 쿨다운 체크
+        if (isInCooldown(userId)) {
+            log.warn("[{}] 쿨다운 중 - 매수 불가", market);
+            return false;
+        }
+
+        // 2. 연속 손실 체크
+        int consecutiveLosses = consecutiveLossMap.getOrDefault(userId, 0);
+        if (consecutiveLosses >= realTradingConfig.getMaxConsecutiveLosses()) {
+            activateCooldown(userId);
+            log.warn("[{}] 연속 손실 {}회 - 쿨다운 활성화", market, consecutiveLosses);
+            return false;
+        }
+
+        // 3. 동시 포지션 수 체크
+        int activePositions = countActivePositions(user);
+        if (activePositions >= realTradingConfig.getMaxConcurrentPositions()) {
+            log.warn("[{}] 동시 포지션 수 초과 ({}/{})", market,
+                    activePositions, realTradingConfig.getMaxConcurrentPositions());
+            return false;
+        }
+
+        // 4. 일일 손실 한도 체크
+        try {
+            double krwBalance = upbitApiService.getKrwBalance(user);
+            BigDecimal todayLoss = dailyLossMap.getOrDefault(userId, BigDecimal.ZERO);
+            BigDecimal maxDailyLoss = BigDecimal.valueOf(krwBalance * realTradingConfig.getMaxDailyLossRate());
+
+            if (todayLoss.abs().compareTo(maxDailyLoss) >= 0) {
+                log.warn("[{}] 일일 손실 한도 초과 (현재: {}, 한도: {})", market,
+                        todayLoss.setScale(0, RoundingMode.HALF_UP),
+                        maxDailyLoss.setScale(0, RoundingMode.HALF_UP));
+                return false;
+            }
+        } catch (Exception e) {
+            log.error("일일 손실 체크 실패: {}", e.getMessage());
+        }
+
+        return true;
+    }
+
+    /**
+     * 활성 포지션 수 계산
+     */
+    private int countActivePositions(User user) {
+        try {
+            List<Account> accounts = upbitApiService.getAccounts(user);
+            return (int) accounts.stream()
+                    .filter(a -> !"KRW".equals(a.getCurrency()))
+                    .filter(a -> Double.parseDouble(a.getBalance()) > 0)
+                    .count();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /**
+     * 쿨다운 활성화
+     */
+    private void activateCooldown(Long userId) {
+        LocalDateTime until = LocalDateTime.now().plusMinutes(realTradingConfig.getCooldownMinutes());
+        cooldownMap.put(userId, until);
+        log.warn("쿨다운 활성화: userId={}, until={}", userId, until);
+    }
+
+    /**
+     * 쿨다운 상태 확인
+     */
+    private boolean isInCooldown(Long userId) {
+        LocalDateTime until = cooldownMap.get(userId);
+        if (until == null) return false;
+        if (LocalDateTime.now().isAfter(until)) {
+            cooldownMap.remove(userId);
+            consecutiveLossMap.remove(userId);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 손실 기록 (리스크 관리용)
+     */
+    private void recordLoss(Long userId, TradeHistory buyHistory, double exitPrice) {
+        double buyPrice = buyHistory.getPrice().doubleValue();
+        double volume = buyHistory.getVolume().doubleValue();
+        BigDecimal loss = BigDecimal.valueOf((exitPrice - buyPrice) * volume);
+
+        dailyLossMap.merge(userId, loss, BigDecimal::add);
+        consecutiveLossMap.merge(userId, 1, Integer::sum);
+
+        log.info("손실 기록: userId={}, loss={}, 연속손실={}", userId,
+                loss.setScale(0, RoundingMode.HALF_UP), consecutiveLossMap.get(userId));
+    }
+
+    /**
+     * 수익 기록 (연속 손실 초기화)
+     */
+    private void recordProfit(Long userId, TradeHistory buyHistory, double exitPrice) {
+        consecutiveLossMap.put(userId, 0);
+        log.info("수익 거래: userId={}, 연속손실 초기화", userId);
+    }
+
+    /**
+     * 분할매수 진입
+     */
+    private void executeBuyWithScaledEntry(User user, String market, double currentPrice,
+                                            String strategyName, Double targetPrice, List<Candle> candles) {
+        if (!isMarketAllowed(market)) {
+            log.warn("[{}] 제외된 마켓입니다. 매수 취소.", market);
+            return;
+        }
+
+        try {
+            double krwBalance = upbitApiService.getKrwBalance(user);
+            double atr = calculateATR(candles, 14);
+
+            // 분할매수 1차 진입 (30%)
+            double entryRatio = realTradingConfig.getEntryRatio(1);
+            double positionRatio = realTradingConfig.getMaxPositionSizeRate();
+            double orderAmount = krwBalance * positionRatio * entryRatio;
+
+            log.info("[{}] 분할매수 1차 진입 - KRW 잔고: {}, 진입비율: {}%, 주문금액: {}, 주문타입: {}",
+                    market, String.format("%.0f", krwBalance),
+                    String.format("%.0f", entryRatio * 100),
+                    String.format("%.0f", orderAmount), orderType);
+
+            if (orderAmount < minOrderAmount) {
+                orderAmount = minOrderAmount;
+            }
+
+            // 주문 실행 (시장가 또는 지정가)
+            OrderResult orderResult = executeBuyOrder(user, market, orderAmount, currentPrice);
+
+            if (!orderResult.isSuccess()) {
+                log.error("[{}] 분할매수 실패: {}", market, orderResult.getErrorMessage());
+                return;
+            }
+
+            log.info("[{}] 분할매수 1차 완료! UUID: {}, 체결가: {}",
+                    market, orderResult.getUuid(), String.format("%.0f", orderResult.getExecutedPrice()));
+
+            // 손절가 계산 (ATR 기반)
+            double stopLossDistance = atr * realTradingConfig.getStopLossAtrMultiplier();
+            double maxStopDistance = currentPrice * Math.abs(realTradingConfig.getMaxStopLossRate());
+            double minStopDistance = currentPrice * Math.abs(realTradingConfig.getMinStopLossRate());
+            stopLossDistance = Math.max(minStopDistance, Math.min(stopLossDistance, maxStopDistance));
+
+            // 거래 내역 저장 (분할매수 정보 포함)
+            double executedPrice = orderResult.getExecutedPrice();
+            double volume = orderResult.getExecutedVolume();
+            double executedAmount = executedPrice * volume;
+
+            TradeHistory history = TradeHistory.builder()
+                    .market(market)
+                    .tradeMethod(orderType)
+                    .tradeDate(LocalDate.now())
+                    .tradeTime(LocalTime.now())
+                    .tradeType(TradeType.BUY)
+                    .amount(BigDecimal.valueOf(executedAmount))
+                    .volume(BigDecimal.valueOf(volume))
+                    .price(BigDecimal.valueOf(executedPrice))
+                    .fee(BigDecimal.valueOf(executedAmount * UPBIT_FEE_RATE))
+                    .orderUuid(orderResult.getUuid())
+                    .strategyName(strategyName)
+                    .targetPrice(targetPrice != null ? BigDecimal.valueOf(targetPrice) : null)
+                    .highestPrice(BigDecimal.valueOf(executedPrice))
+                    .avgEntryPrice(BigDecimal.valueOf(executedPrice))
+                    .totalInvested(BigDecimal.valueOf(executedAmount))
+                    .entryPhase(1)
+                    .exitPhase(0)
+                    .halfSold(false)
+                    .trailingActive(false)
+                    .isStopLoss(false)
+                    .build();
+
+            tradeHistoryRepository.save(history);
+
+        } catch (Exception e) {
+            log.error("[{}] 분할매수 실행 실패: {}", market, e.getMessage());
+        }
+    }
+
+    // ==================== 지정가/시장가 주문 통합 메서드 ====================
+
+    /**
+     * 매수 주문 실행 (시장가 또는 지정가)
+     */
+    private OrderResult executeBuyOrder(User user, String market, double orderAmount, double currentPrice) {
+        if ("LIMIT".equalsIgnoreCase(orderType)) {
+            return executeLimitBuyOrder(user, market, orderAmount, currentPrice);
+        } else {
+            return executeMarketBuyOrder(user, market, orderAmount, currentPrice);
+        }
+    }
+
+    /**
+     * 매도 주문 실행 (시장가 또는 지정가)
+     */
+    private OrderResult executeSellOrder(User user, String market, double volume, double currentPrice) {
+        if ("LIMIT".equalsIgnoreCase(orderType)) {
+            return executeLimitSellOrder(user, market, volume, currentPrice);
+        } else {
+            return executeMarketSellOrder(user, market, volume, currentPrice);
+        }
+    }
+
+    /**
+     * 시장가 매수 실행
+     */
+    private OrderResult executeMarketBuyOrder(User user, String market, double orderAmount, double currentPrice) {
+        try {
+            OrderResponse order = upbitApiService.buyMarketOrder(user, market, orderAmount);
+            double volume = orderAmount / currentPrice;
+            return OrderResult.success(order.getUuid(), currentPrice, volume, "MARKET");
+        } catch (Exception e) {
+            return OrderResult.failed(e.getMessage());
+        }
+    }
+
+    /**
+     * 시장가 매도 실행
+     */
+    private OrderResult executeMarketSellOrder(User user, String market, double volume, double currentPrice) {
+        try {
+            OrderResponse order = upbitApiService.sellMarketOrder(user, market, volume);
+            return OrderResult.success(order.getUuid(), currentPrice, volume, "MARKET");
+        } catch (Exception e) {
+            return OrderResult.failed(e.getMessage());
+        }
+    }
+
+    /**
+     * 지정가 매수 실행 (체결 확인 + 재시도 로직)
+     */
+    private OrderResult executeLimitBuyOrder(User user, String market, double orderAmount, double currentPrice) {
+        int retryCount = 0;
+        double adjustedPrice = currentPrice;
+
+        while (retryCount <= limitOrderRetryCount) {
+            try {
+                // 호가창에서 최적 매수가 계산
+                double limitPrice = calculateLimitBuyPrice(market, adjustedPrice);
+                double volume = orderAmount / limitPrice;
+
+                log.info("[{}] 지정가 매수 시도 ({}/{}) - 가격: {}, 수량: {}",
+                        market, retryCount + 1, limitOrderRetryCount + 1,
+                        String.format("%.0f", limitPrice), String.format("%.8f", volume));
+
+                OrderResponse order = upbitApiService.buyLimitOrder(user, market, volume, limitPrice);
+                String uuid = order.getUuid();
+
+                // 체결 대기 및 확인
+                OrderResult result = waitForOrderExecution(user, uuid, limitPrice, volume, "BUY");
+
+                if (result.isSuccess()) {
+                    log.info("[{}] 지정가 매수 체결 완료! 가격: {}, 수량: {}",
+                            market, String.format("%.0f", result.getExecutedPrice()),
+                            String.format("%.8f", result.getExecutedVolume()));
+                    return result;
+                } else if (result.isPartialFill()) {
+                    log.info("[{}] 지정가 매수 부분 체결 - 체결수량: {}",
+                            market, String.format("%.8f", result.getExecutedVolume()));
+                    // 부분 체결도 성공으로 처리
+                    return result;
+                } else {
+                    // 미체결 - 주문 취소 후 재시도
+                    log.warn("[{}] 지정가 매수 미체결 - 주문 취소 후 재시도", market);
+                    try {
+                        upbitApiService.cancelOrder(user, uuid);
+                    } catch (Exception e) {
+                        log.warn("[{}] 주문 취소 실패 (이미 체결되었을 수 있음): {}", market, e.getMessage());
+                    }
+
+                    retryCount++;
+                    // 재시도 시 가격 상향 조정 (체결률 향상)
+                    adjustedPrice = limitPrice * (1 + limitOrderRetryPriceAdjust);
+                    Thread.sleep(1000);
+                }
+
+            } catch (Exception e) {
+                log.error("[{}] 지정가 매수 오류: {}", market, e.getMessage());
+                retryCount++;
+                adjustedPrice = adjustedPrice * (1 + limitOrderRetryPriceAdjust);
+            }
+        }
+
+        // 모든 재시도 실패 시 시장가로 폴백
+        log.warn("[{}] 지정가 매수 재시도 초과 - 시장가로 전환", market);
+        return executeMarketBuyOrder(user, market, orderAmount, currentPrice);
+    }
+
+    /**
+     * 지정가 매도 실행 (체결 확인 + 재시도 로직)
+     */
+    private OrderResult executeLimitSellOrder(User user, String market, double volume, double currentPrice) {
+        int retryCount = 0;
+        double adjustedPrice = currentPrice;
+
+        while (retryCount <= limitOrderRetryCount) {
+            try {
+                // 호가창에서 최적 매도가 계산
+                double limitPrice = calculateLimitSellPrice(market, adjustedPrice);
+
+                log.info("[{}] 지정가 매도 시도 ({}/{}) - 가격: {}, 수량: {}",
+                        market, retryCount + 1, limitOrderRetryCount + 1,
+                        String.format("%.0f", limitPrice), String.format("%.8f", volume));
+
+                OrderResponse order = upbitApiService.sellLimitOrder(user, market, volume, limitPrice);
+                String uuid = order.getUuid();
+
+                // 체결 대기 및 확인
+                OrderResult result = waitForOrderExecution(user, uuid, limitPrice, volume, "SELL");
+
+                if (result.isSuccess()) {
+                    log.info("[{}] 지정가 매도 체결 완료! 가격: {}, 수량: {}",
+                            market, String.format("%.0f", result.getExecutedPrice()),
+                            String.format("%.8f", result.getExecutedVolume()));
+                    return result;
+                } else if (result.isPartialFill()) {
+                    log.info("[{}] 지정가 매도 부분 체결 - 체결수량: {}",
+                            market, String.format("%.8f", result.getExecutedVolume()));
+                    return result;
+                } else {
+                    // 미체결 - 주문 취소 후 재시도
+                    log.warn("[{}] 지정가 매도 미체결 - 주문 취소 후 재시도", market);
+                    try {
+                        upbitApiService.cancelOrder(user, uuid);
+                    } catch (Exception e) {
+                        log.warn("[{}] 주문 취소 실패: {}", market, e.getMessage());
+                    }
+
+                    retryCount++;
+                    // 재시도 시 가격 하향 조정 (체결률 향상)
+                    adjustedPrice = limitPrice * (1 - limitOrderRetryPriceAdjust);
+                    Thread.sleep(1000);
+                }
+
+            } catch (Exception e) {
+                log.error("[{}] 지정가 매도 오류: {}", market, e.getMessage());
+                retryCount++;
+                adjustedPrice = adjustedPrice * (1 - limitOrderRetryPriceAdjust);
+            }
+        }
+
+        // 모든 재시도 실패 시 시장가로 폴백
+        log.warn("[{}] 지정가 매도 재시도 초과 - 시장가로 전환", market);
+        return executeMarketSellOrder(user, market, volume, currentPrice);
+    }
+
+    /**
+     * 지정가 매수 가격 계산 (호가창 기반)
+     */
+    private double calculateLimitBuyPrice(String market, double currentPrice) {
+        try {
+            var orderbook = upbitApiService.getOrderbook(market);
+            if (orderbook != null) {
+                // 매도 1호가 (ask) 사용 - 빠른 체결을 위해
+                double askPrice = orderbook.getAskPrice(0);
+                // 매도 1호가에 약간의 프리미엄 추가
+                return askPrice * (1 + limitBuyOffset);
+            }
+        } catch (Exception e) {
+            log.warn("[{}] 호가창 조회 실패, 현재가 기준 계산", market);
+        }
+        // 호가창 실패 시 현재가 기준
+        return currentPrice * (1 + limitBuyOffset);
+    }
+
+    /**
+     * 지정가 매도 가격 계산 (호가창 기반)
+     */
+    private double calculateLimitSellPrice(String market, double currentPrice) {
+        try {
+            var orderbook = upbitApiService.getOrderbook(market);
+            if (orderbook != null) {
+                // 매수 1호가 (bid) 사용 - 빠른 체결을 위해
+                double bidPrice = orderbook.getBidPrice(0);
+                // 매수 1호가에서 약간 할인
+                return bidPrice * (1 - limitSellOffset);
+            }
+        } catch (Exception e) {
+            log.warn("[{}] 호가창 조회 실패, 현재가 기준 계산", market);
+        }
+        // 호가창 실패 시 현재가 기준
+        return currentPrice * (1 - limitSellOffset);
+    }
+
+    /**
+     * 주문 체결 대기 및 확인
+     */
+    private OrderResult waitForOrderExecution(User user, String uuid, double orderPrice,
+                                               double orderVolume, String side) {
+        long startTime = System.currentTimeMillis();
+        long timeoutMs = limitOrderTimeout * 1000L;
+
+        while (System.currentTimeMillis() - startTime < timeoutMs) {
+            try {
+                OrderResponse order = upbitApiService.getOrder(user, uuid);
+
+                if (order == null) {
+                    Thread.sleep(limitOrderPollInterval * 1000L);
+                    continue;
+                }
+
+                String state = order.getState();
+
+                // 완전 체결
+                if ("done".equals(state)) {
+                    double executedVolume = parseDouble(order.getExecutedVolume(), orderVolume);
+                    double avgPrice = parseDouble(order.getAvgPrice(), orderPrice);
+                    return OrderResult.success(uuid, avgPrice, executedVolume, "LIMIT");
+                }
+
+                // 취소됨
+                if ("cancel".equals(state)) {
+                    double executedVolume = parseDouble(order.getExecutedVolume(), 0);
+                    if (executedVolume > 0) {
+                        // 부분 체결 후 취소
+                        double avgPrice = parseDouble(order.getAvgPrice(), orderPrice);
+                        return OrderResult.partialFill(uuid, avgPrice, executedVolume, "LIMIT");
+                    }
+                    return OrderResult.failed("주문 취소됨");
+                }
+
+                // 대기 중 (wait) - 계속 폴링
+                Thread.sleep(limitOrderPollInterval * 1000L);
+
+            } catch (Exception e) {
+                log.warn("주문 상태 조회 실패: {}", e.getMessage());
+                try {
+                    Thread.sleep(limitOrderPollInterval * 1000L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        // 타임아웃 - 미체결로 처리
+        return OrderResult.timeout(uuid);
+    }
+
+    /**
+     * String을 double로 안전하게 파싱
+     */
+    private double parseDouble(String value, double defaultValue) {
+        if (value == null || value.isEmpty()) {
+            return defaultValue;
+        }
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    // ==================== 주문 결과 DTO ====================
+
+    /**
+     * 주문 결과 클래스
+     */
+    @lombok.Data
+    @lombok.Builder
+    private static class OrderResult {
+        private boolean success;
+        private boolean partialFill;
+        private boolean timeout;
+        private String uuid;
+        private double executedPrice;
+        private double executedVolume;
+        private String orderType;
+        private String errorMessage;
+
+        public static OrderResult success(String uuid, double price, double volume, String type) {
+            return OrderResult.builder()
+                    .success(true)
+                    .uuid(uuid)
+                    .executedPrice(price)
+                    .executedVolume(volume)
+                    .orderType(type)
+                    .build();
+        }
+
+        public static OrderResult partialFill(String uuid, double price, double volume, String type) {
+            return OrderResult.builder()
+                    .success(true)
+                    .partialFill(true)
+                    .uuid(uuid)
+                    .executedPrice(price)
+                    .executedVolume(volume)
+                    .orderType(type)
+                    .build();
+        }
+
+        public static OrderResult failed(String message) {
+            return OrderResult.builder()
+                    .success(false)
+                    .errorMessage(message)
+                    .build();
+        }
+
+        public static OrderResult timeout(String uuid) {
+            return OrderResult.builder()
+                    .success(false)
+                    .timeout(true)
+                    .uuid(uuid)
+                    .errorMessage("주문 체결 타임아웃")
+                    .build();
+        }
+    }
+
+    /**
+     * 거래 내역 저장 (청산 단계 포함)
+     */
+    private void saveTradeHistoryWithPhase(String market, TradeType tradeType, double amount,
+                                            double price, String orderUuid, String strategyName,
+                                            Double targetPrice, int exitPhase) {
+        try {
+            double volume = amount / price;
+            double fee = amount * UPBIT_FEE_RATE;
+
+            TradeHistory history = TradeHistory.builder()
+                    .market(market)
+                    .tradeMethod("MARKET")
+                    .tradeDate(LocalDate.now())
+                    .tradeTime(LocalTime.now())
+                    .tradeType(tradeType)
+                    .amount(BigDecimal.valueOf(amount))
+                    .volume(BigDecimal.valueOf(volume))
+                    .price(BigDecimal.valueOf(price))
+                    .fee(BigDecimal.valueOf(fee))
+                    .orderUuid(orderUuid)
+                    .strategyName(strategyName)
+                    .targetPrice(targetPrice != null ? BigDecimal.valueOf(targetPrice) : null)
+                    .exitPhase(exitPhase)
+                    .build();
+
+            tradeHistoryRepository.save(history);
+            log.info("[{}] 거래 내역 저장 - {}, 금액: {}, 청산단계: {}",
+                    market, tradeType, String.format("%.0f", amount), exitPhase);
+
+        } catch (Exception e) {
+            log.error("[{}] 거래 내역 저장 실패: {}", market, e.getMessage());
         }
     }
 
