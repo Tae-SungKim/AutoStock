@@ -345,13 +345,15 @@ public class BacktestController {
             @RequestParam(defaultValue = "KRW-BTC,KRW-ETH,KRW-XRP") String markets,
             @RequestParam(required = false) String strategy,
             @RequestParam(defaultValue = "1000000") double initialBalancePerMarket,
-            @RequestParam(required = false) Integer unit) {
+            @RequestParam(required = false) Integer unit,
+            @RequestParam(required = false) String startDate,
+            @RequestParam(required = false) String endDate) {
 
         List<String> marketList = Arrays.asList(markets.split(","));
         log.info("DB 데이터 기반 멀티 코인 백테스팅 요청 - {}개 마켓, 전략: {}", marketList.size(), strategy);
 
         MultiCoinBacktestResult result = backtestService.runMultiCoinBacktestFromDb(
-                marketList, strategy, initialBalancePerMarket, unit);
+                marketList, strategy, initialBalancePerMarket, unit, startDate, endDate);
         return ResponseEntity.ok(result);
     }
 

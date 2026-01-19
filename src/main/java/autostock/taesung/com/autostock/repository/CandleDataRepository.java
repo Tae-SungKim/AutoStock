@@ -54,4 +54,29 @@ public interface CandleDataRepository extends JpaRepository<CandleData, Long> {
      */
     @Query("SELECT c FROM CandleData c WHERE c.unit = :unit ORDER BY c.market, c.candleDateTimeKst ASC")
     List<CandleData> findAllByUnitOrderByMarketAndTime(@Param("unit") int unit);
+
+    /**
+     * 마켓과 시작일/종료일로 캔들 데이터 조회 (날짜 형식: yyyy-MM-dd)
+     */
+    @Query("SELECT c FROM CandleData c WHERE c.market = :market " +
+            "AND c.candleDateTimeKst >= :startDate " +
+            "AND c.candleDateTimeKst < :endDateNext " +
+            "ORDER BY c.candleDateTimeKst ASC")
+    List<CandleData> findByMarketAndDateRange(
+            @Param("market") String market,
+            @Param("startDate") String startDate,
+            @Param("endDateNext") String endDateNext);
+
+    /**
+     * 마켓, unit, 시작일/종료일로 캔들 데이터 조회 (날짜 형식: yyyy-MM-dd)
+     */
+    @Query("SELECT c FROM CandleData c WHERE c.market = :market AND c.unit = :unit " +
+            "AND c.candleDateTimeKst >= :startDate " +
+            "AND c.candleDateTimeKst < :endDateNext " +
+            "ORDER BY c.candleDateTimeKst ASC")
+    List<CandleData> findByMarketAndUnitAndDateRange(
+            @Param("market") String market,
+            @Param("unit") int unit,
+            @Param("startDate") String startDate,
+            @Param("endDateNext") String endDateNext);
 }

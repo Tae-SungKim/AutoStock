@@ -70,7 +70,7 @@ public class UserAutoTradingService {
     @Value("${trading.market-range-count:100}")
     private int marketRangeCount;
 
-    @Value("${trading.investment-ratio:0.1}")
+    @Value("${trading.investment-ratio:0.2}")
     private double investmentRatio;
 
     @Value("${trading.min-order-amount:5000}")

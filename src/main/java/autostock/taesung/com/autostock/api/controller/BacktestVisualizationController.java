@@ -98,13 +98,16 @@ public class BacktestVisualizationController {
         @SuppressWarnings("unchecked")
         List<String> markets = (List<String>) request.get("markets");
         String strategy = (String) request.get("strategy");
+
+        String startDate = (String) request.get("startDate");
+        String endDate = (String) request.get("endDate");
         double initialBalance = request.containsKey("initialBalance") ?
                 Double.parseDouble(request.get("initialBalance").toString()) : 1000000;
         Integer unit = request.containsKey("unit") ?
                 Integer.parseInt(request.get("unit").toString()) : null;
 
         BacktestVisualizationService.CoinHeatmapData data =
-                visualizationService.getCoinHeatmapFromDb(markets, strategy, initialBalance, unit);
+                visualizationService.getCoinHeatmapFromDb(markets, strategy, initialBalance, unit, startDate, endDate);
         return ResponseEntity.ok(data);
     }
 }

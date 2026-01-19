@@ -78,7 +78,7 @@ public class AutoTradingService {
     @Value("${trading.market-range-count:100}")
     private int marketRangeCount;
 
-    @Value("${trading.investment-ratio:0.1}")
+    @Value("${trading.investment-ratio:0.2}")
     private double investmentRatio;  // 투자 비율 (예: 0.1 = 10%)
 
     @Value("${trading.min-order-amount:6000}")

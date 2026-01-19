@@ -211,9 +211,10 @@ public class BacktestVisualizationService {
      * DB 기반 멀티코인 히트맵 데이터
      */
     public CoinHeatmapData getCoinHeatmapFromDb(List<String> markets, String strategyName,
-                                                  double initialBalance, Integer unit) {
+                                                  double initialBalance, Integer unit,
+                                                String startDate, String endDate) {
         MultiCoinBacktestResult result = backtestService.runMultiCoinBacktestFromDb(
-                markets, strategyName, initialBalance, unit);
+                markets, strategyName, initialBalance, unit, startDate, endDate);
 
         List<Double> profitRates = new ArrayList<>();
         List<Double> winRates = new ArrayList<>();
