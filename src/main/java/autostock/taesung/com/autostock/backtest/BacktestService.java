@@ -698,6 +698,7 @@ public class BacktestService {
     /**
      * 단일 전략 백테스팅 (실제 전략 로직 사용)
      * - analyzeForBacktest를 호출하여 실제 매매와 동일한 로직으로 시뮬레이션
+     * - 성능 최적화: 미리 역순 리스트를 생성하여 O(n²) -> O(n)으로 개선
      */
     private BacktestResult executeBacktestSingleStrategy(String market, TradingStrategy strategy,
                                                          List<Candle> candles, double initialBalance) {
@@ -721,9 +722,19 @@ public class BacktestService {
         // 백테스트용 포지션 객체 (전략에 전달)
         BacktestPosition position = BacktestPosition.empty();
 
-        for (int i = minRequiredCandles; i < candles.size(); i++) {
-            List<Candle> currentCandles = new ArrayList<>(candles.subList(0, i + 1));
-            Collections.reverse(currentCandles);
+        // 성능 최적화: 미리 역순 리스트 생성 (O(n) 한 번만)
+        // 기존: 매 반복마다 복사 + 역순 = O(n²)
+        // 개선: 미리 역순 생성 + subList 뷰 사용 = O(n)
+        List<Candle> reversedCandles = new ArrayList<>(candles);
+        Collections.reverse(reversedCandles);
+        int totalSize = candles.size();
+
+        for (int i = minRequiredCandles; i < totalSize; i++) {
+            // reversedCandles에서 뒤쪽 (i+1)개가 candles[0..i]의 역순
+            // 예: candles = [A,B,C,D,E], reversedCandles = [E,D,C,B,A]
+            // i=2 -> candles[0..2] = [A,B,C] 역순 = [C,B,A] = reversedCandles[2..5]
+            int fromIndex = totalSize - (i + 1);
+            List<Candle> currentCandles = reversedCandles.subList(fromIndex, totalSize);
 
             Candle currentCandle = candles.get(i);
             double currentPrice = currentCandle.getTradePrice().doubleValue();
