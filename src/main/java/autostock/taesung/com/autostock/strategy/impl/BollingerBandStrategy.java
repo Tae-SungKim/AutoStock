@@ -121,7 +121,7 @@ public class BollingerBandStrategy implements TradingStrategy {
             buyCreatedAt = latest.getCreatedAt();
         }
 
-        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, isSell, lastTradeAt);
+        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, isSell, lastTradeAt, false);
     }
 
     @Override
@@ -130,12 +130,14 @@ public class BollingerBandStrategy implements TradingStrategy {
         double buyPrice = holding ? position.getBuyPrice() : 0;
         double highestPrice = holding ? position.getHighestPrice() : 0;
         LocalDateTime buyCreatedAt = (holding && position.getBuyTime() != null) ? position.getBuyTime() : LocalDateTime.now();
-        
-        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, false, LocalDateTime.now());
+
+        // 백테스트 모드로 호출 (호가창 검증 스킵)
+        return analyzeLogic(market, candles, holding, buyPrice, highestPrice, buyCreatedAt, false, LocalDateTime.now(), true);
     }
 
-    private int analyzeLogic(String market, List<Candle> candles, boolean holding, double buyPrice, 
-                             double highestPrice, LocalDateTime buyCreatedAt, boolean isSell, LocalDateTime lastTradeAt) {
+    private int analyzeLogic(String market, List<Candle> candles, boolean holding, double buyPrice,
+                             double highestPrice, LocalDateTime buyCreatedAt, boolean isSell, LocalDateTime lastTradeAt,
+                             boolean isBacktest) {
         
         if (candles.size() < 30) return 0;
 
@@ -283,15 +285,15 @@ public class BollingerBandStrategy implements TradingStrategy {
          * 7️⃣ [4] 매수 신호 + 호가창 최종 검증
          * ===================================================== */
         if (stochEntry || volumeBreakout) {
-            // [3] 호가창 최종 검증 (진입 시에만 호출 - API 부담 최소화)
-            if (!validateOrderbookForEntry(market, currentPrice)) {
+            // [3] 호가창 최종 검증 (백테스트에서는 스킵)
+            if (!isBacktest && !validateOrderbookForEntry(market, currentPrice)) {
                 targetPrice.remove();
                 return 0;  // 검증 실패 시 진입 포기
             }
             this.targetPrice.set(currentPrice + atr * 1.5);
             // [8] 매수 진입 로깅 개선
-            log.info("[{}] 매수 진입 - Price: {}, RSI: {}, ATR: {}", market, String.format("%.0f", currentPrice),
-                    String.format("%.1f", rsi), String.format("%.2f", atr));
+            log.info("[{}]{} 매수 진입 - Price: {}, RSI: {}, ATR: {}", market, isBacktest ? "[백테스트]" : "",
+                    String.format("%.0f", currentPrice), String.format("%.1f", rsi), String.format("%.2f", atr));
             return 1;
         }
 

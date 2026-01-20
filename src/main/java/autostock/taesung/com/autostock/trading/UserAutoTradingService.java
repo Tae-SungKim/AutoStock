@@ -20,11 +20,17 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 /**
@@ -47,6 +53,12 @@ public class UserAutoTradingService {
     private static final int PERIOD = 100;
     // 최소 거래량 설정 (KRW 기준)
     private static final double MIN_TRADE_VOLUME_KRW = 200_000_000;  // 5억원 이상
+
+    // 지정가 주문 설정
+    private static final long LIMIT_ORDER_TIMEOUT_MS = 10_000;  // 지정가 체결 대기 시간 (10초)
+    private static final boolean FALLBACK_TO_MARKET = true;     // 미체결 시 시장가 전환
+    private static final double BUY_PRICE_ADJUSTMENT = 1.001;   // 매수가 조정 (현재가 + 0.1%)
+    private static final double SELL_PRICE_ADJUSTMENT = 0.999;  // 매도가 조정 (현재가 - 0.1%)
 
     @Value("${trading.target-market:KRW-BTC}")
     private String defaultTargetMarket;
@@ -78,6 +90,44 @@ public class UserAutoTradingService {
 
     private final int minuteInterval = 1;
     private final int candleCount = 100;
+
+    // 비동기 주문 처리용 Executor
+    private final Executor orderExecutor = Executors.newFixedThreadPool(5);
+
+    // 대기 중인 주문 추적 (key: orderUuid, value: PendingOrder)
+    private final Map<String, PendingOrder> pendingOrders = new ConcurrentHashMap<>();
+
+    /**
+     * 대기 중인 주문 정보
+     */
+    private static class PendingOrder {
+        final User user;
+        final String market;
+        final String uuid;
+        final TradeType tradeType;
+        final double originalPrice;
+        final double volume;
+        final String strategyName;
+        final Double targetPrice;
+        final LocalDateTime createdAt;
+
+        PendingOrder(User user, String market, String uuid, TradeType tradeType,
+                     double originalPrice, double volume, String strategyName, Double targetPrice) {
+            this.user = user;
+            this.market = market;
+            this.uuid = uuid;
+            this.tradeType = tradeType;
+            this.originalPrice = originalPrice;
+            this.volume = volume;
+            this.strategyName = strategyName;
+            this.targetPrice = targetPrice;
+            this.createdAt = LocalDateTime.now();
+        }
+
+        boolean isExpired() {
+            return LocalDateTime.now().isAfter(createdAt.plusSeconds(LIMIT_ORDER_TIMEOUT_MS / 1000));
+        }
+    }
 
     /**
      * 특정 사용자의 자동매매 실행
@@ -283,17 +333,17 @@ public class UserAutoTradingService {
         }
     }
 
+    /**
+     * 지정가 매수 실행 (비동기)
+     * - 현재가 + 0.1% 가격으로 지정가 매수
+     * - 주문 즉시 반환, 체결 대기는 비동기로 처리
+     * - 10초 내 미체결 시 시장가로 전환
+     */
     private void executeBuyForMarket(User user, String market, double currentPrice,
                                       String strategyName, Double targetPrice) {
         try {
             double krwBalance = upbitApiService.getKrwBalance(user);
-
-            List<String> activeMarkets = getActiveMarkets(parseExcludedMarkets());
-            /*double marketRatio = multiMarketEnabled && activeMarkets.size() > 1
-                    ? investmentRatio / activeMarkets.size()
-                    : investmentRatio;*/
             double marketRatio = investmentRatio;
-
             double orderAmount = krwBalance * marketRatio;
 
             log.info("[{}][{}] KRW 잔고: {}, 주문 금액: {}",
@@ -307,17 +357,40 @@ public class UserAutoTradingService {
                 orderAmount = minOrderAmount;
             }
 
-            OrderResponse order = upbitApiService.buyMarketOrder(user, market, orderAmount);
-            log.info("[{}][{}] 매수 주문 완료! UUID: {}", user.getUsername(), market, order.getUuid());
+            // 지정가 매수: 현재가 + 0.1% (빠른 체결 유도)
+            double limitPrice = currentPrice * BUY_PRICE_ADJUSTMENT;
+            double volume = orderAmount / limitPrice;
 
-            saveTradeHistory(user, market, TradeType.BUY, orderAmount, currentPrice,
-                    order.getUuid(), strategyName, targetPrice);
+            log.info("[{}][{}] 지정가 매수 주문 - 가격: {}, 수량: {}",
+                    user.getUsername(), market,
+                    String.format("%.0f", limitPrice),
+                    String.format("%.8f", volume));
+
+            // 1단계: 지정가 주문만 제출 (대기 없이 즉시 반환)
+            OrderResponse order = upbitApiService.buyLimitOrder(user, market, volume, limitPrice);
+
+            if (order != null && order.getUuid() != null) {
+                log.info("[{}][{}] 지정가 매수 주문 제출 완료 - UUID: {}", user.getUsername(), market, order.getUuid());
+
+                // 2단계: 비동기로 체결 대기 및 후처리
+                final double finalOrderAmount = orderAmount;
+                CompletableFuture.runAsync(() -> {
+                    monitorAndCompleteOrder(user, market, order.getUuid(), TradeType.BUY,
+                            limitPrice, volume, finalOrderAmount, strategyName, targetPrice);
+                }, orderExecutor);
+            }
 
         } catch (Exception e) {
-            log.error("[{}][{}] 매수 실행 실패: {}", user.getUsername(), market, e.getMessage());
+            log.error("[{}][{}] 매수 주문 제출 실패: {}", user.getUsername(), market, e.getMessage());
         }
     }
 
+    /**
+     * 지정가 매도 실행 (비동기)
+     * - 현재가 - 0.1% 가격으로 지정가 매도
+     * - 주문 즉시 반환, 체결 대기는 비동기로 처리
+     * - 10초 내 미체결 시 시장가로 전환
+     */
     private void executeSellForMarket(User user, String market, double currentPrice, String strategyName) {
         try {
             String currency = market.split("-")[1];
@@ -330,25 +403,143 @@ public class UserAutoTradingService {
                 return;
             }
 
-            OrderResponse order = upbitApiService.sellMarketOrder(user, market, coinBalance);
-            log.info("[{}][{}] 매도 주문 완료! UUID: {}", user.getUsername(), market, order.getUuid());
+            // 지정가 매도: 현재가 - 0.1% (빠른 체결 유도)
+            double limitPrice = currentPrice * SELL_PRICE_ADJUSTMENT;
 
-            double sellAmount = coinBalance * currentPrice;
-            saveTradeHistory(user, market, TradeType.SELL, sellAmount, currentPrice,
-                    order.getUuid(), strategyName, null);
+            log.info("[{}][{}] 지정가 매도 주문 - 가격: {}, 수량: {}",
+                    user.getUsername(), market,
+                    String.format("%.0f", limitPrice),
+                    String.format("%.8f", coinBalance));
 
-            // 전략별 포지션 청산
-            for (TradingStrategy strategy : allStrategies) {
-                strategy.clearPosition(market);
+            // 1단계: 지정가 주문만 제출 (대기 없이 즉시 반환)
+            OrderResponse order = upbitApiService.sellLimitOrder(user, market, coinBalance, limitPrice);
+
+            if (order != null && order.getUuid() != null) {
+                log.info("[{}][{}] 지정가 매도 주문 제출 완료 - UUID: {}", user.getUsername(), market, order.getUuid());
+
+                // 2단계: 비동기로 체결 대기 및 후처리
+                CompletableFuture.runAsync(() -> {
+                    monitorAndCompleteOrder(user, market, order.getUuid(), TradeType.SELL,
+                            limitPrice, coinBalance, coinBalance * limitPrice, strategyName, null);
+                }, orderExecutor);
             }
 
         } catch (Exception e) {
-            log.error("[{}][{}] 매도 실행 실패: {}", user.getUsername(), market, e.getMessage());
+            log.error("[{}][{}] 매도 주문 제출 실패: {}", user.getUsername(), market, e.getMessage());
         }
     }
 
+    /**
+     * 비동기 주문 체결 모니터링 및 완료 처리
+     * - 10초간 체결 대기
+     * - 미체결 시 취소 후 시장가 전환
+     * - 체결 완료 시 거래 내역 저장
+     */
+    private void monitorAndCompleteOrder(User user, String market, String orderUuid,
+                                          TradeType tradeType, double limitPrice, double volume,
+                                          double orderAmount, String strategyName, Double targetPrice) {
+        try {
+            long startTime = System.currentTimeMillis();
+            OrderResponse lastOrder = null;
+            String tradeMethod = "LIMIT";
+
+            // 10초간 체결 대기 (1초 간격 폴링)
+            while (System.currentTimeMillis() - startTime < LIMIT_ORDER_TIMEOUT_MS) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+
+                lastOrder = upbitApiService.getOrder(user, orderUuid);
+                if (lastOrder == null) continue;
+
+                // 체결 완료
+                if ("done".equals(lastOrder.getState())) {
+                    log.info("[{}][{}] 지정가 {} 체결 완료 - UUID: {}",
+                            user.getUsername(), market,
+                            tradeType == TradeType.BUY ? "매수" : "매도",
+                            orderUuid);
+                    break;
+                }
+                // 취소됨
+                if ("cancel".equals(lastOrder.getState())) {
+                    log.warn("[{}][{}] 주문 취소됨 - UUID: {}", user.getUsername(), market, orderUuid);
+                    return;
+                }
+            }
+
+            // 타임아웃 - 미체결 처리
+            if (lastOrder == null || !"done".equals(lastOrder.getState())) {
+                log.warn("[{}][{}] 지정가 주문 타임아웃 - UUID: {}", user.getUsername(), market, orderUuid);
+
+                // 미체결 주문 취소
+                upbitApiService.cancelOrder(user, orderUuid);
+
+                if (FALLBACK_TO_MARKET) {
+                    // 시장가로 전환
+                    double remainingVolume = volume;
+                    if (lastOrder != null && lastOrder.getExecutedVolume() != null) {
+                        remainingVolume = volume - Double.parseDouble(lastOrder.getExecutedVolume());
+                    }
+
+                    if (remainingVolume > 0) {
+                        log.info("[{}][{}] 시장가로 전환 - 미체결 수량: {}",
+                                user.getUsername(), market, String.format("%.8f", remainingVolume));
+
+                        if (tradeType == TradeType.BUY) {
+                            double marketOrderAmount = remainingVolume * limitPrice;
+                            lastOrder = upbitApiService.buyMarketOrder(user, market, marketOrderAmount);
+                        } else {
+                            lastOrder = upbitApiService.sellMarketOrder(user, market, remainingVolume);
+                        }
+                        tradeMethod = "MARKET";
+                    }
+                }
+            }
+
+            // 거래 내역 저장
+            if (lastOrder != null) {
+                double executedPrice = limitPrice;
+                double executedAmount = orderAmount;
+
+                if (lastOrder.getExecutedFunds() != null) {
+                    executedAmount = Double.parseDouble(lastOrder.getExecutedFunds());
+                }
+                if (lastOrder.getAvgPrice() != null) {
+                    executedPrice = Double.parseDouble(lastOrder.getAvgPrice());
+                }
+
+                log.info("[{}][{}] {} 완료 - 방식: {}, 체결가: {}, 금액: {}",
+                        user.getUsername(), market,
+                        tradeType == TradeType.BUY ? "매수" : "매도",
+                        tradeMethod,
+                        String.format("%.0f", executedPrice),
+                        String.format("%.0f", executedAmount));
+
+                saveTradeHistory(user, market, tradeType, executedAmount, executedPrice,
+                        lastOrder.getUuid(), strategyName, targetPrice, tradeMethod);
+
+                // 매도 시 포지션 청산
+                if (tradeType == TradeType.SELL) {
+                    for (TradingStrategy strategy : allStrategies) {
+                        strategy.clearPosition(market);
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("[{}][{}] 주문 모니터링 실패: {}", user.getUsername(), market, e.getMessage());
+        }
+    }
+
+    /**
+     * 거래 내역 저장 (tradeMethod 지정)
+     */
     private void saveTradeHistory(User user, String market, TradeType tradeType, double amount,
-                                   double price, String orderUuid, String strategyName, Double targetPrice) {
+                                   double price, String orderUuid, String strategyName,
+                                   Double targetPrice, String tradeMethod) {
         try {
             double volume = amount / price;
             double fee = amount * UPBIT_FEE_RATE;
@@ -356,7 +547,7 @@ public class UserAutoTradingService {
             TradeHistory history = TradeHistory.builder()
                     .userId(user.getId())
                     .market(market)
-                    .tradeMethod("MARKET")
+                    .tradeMethod(tradeMethod)
                     .tradeDate(LocalDate.now())
                     .tradeTime(LocalTime.now())
                     .tradeType(tradeType)
@@ -367,17 +558,25 @@ public class UserAutoTradingService {
                     .orderUuid(orderUuid)
                     .strategyName(strategyName)
                     .targetPrice(targetPrice != null ? BigDecimal.valueOf(targetPrice) : null)
-                    .highestPrice(tradeType == TradeType.BUY ? BigDecimal.valueOf(price) : null)  // 매수 시 최고가 초기화
+                    .highestPrice(tradeType == TradeType.BUY ? BigDecimal.valueOf(price) : null)
                     .build();
 
             tradeHistoryRepository.save(history);
-            log.info("[{}][{}] 거래 내역 저장 완료 - {}, 금액: {}, 수수료: {}",
-                    user.getUsername(), market, tradeType,
+            log.info("[{}][{}] 거래 내역 저장 완료 - {}, 방식: {}, 금액: {}, 수수료: {}",
+                    user.getUsername(), market, tradeType, tradeMethod,
                     String.format("%.0f", amount), String.format("%.0f", fee));
 
         } catch (Exception e) {
             log.error("[{}][{}] 거래 내역 저장 실패: {}", user.getUsername(), market, e.getMessage());
         }
+    }
+
+    /**
+     * 거래 내역 저장 (기본 - 시장가)
+     */
+    private void saveTradeHistory(User user, String market, TradeType tradeType, double amount,
+                                   double price, String orderUuid, String strategyName, Double targetPrice) {
+        saveTradeHistory(user, market, tradeType, amount, price, orderUuid, strategyName, targetPrice, "MARKET");
     }
 
     /**

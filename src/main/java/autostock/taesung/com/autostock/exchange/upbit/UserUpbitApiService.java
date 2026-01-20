@@ -242,6 +242,226 @@ public class UserUpbitApiService {
         return response.getBody();
     }
 
+    // ==================== 지정가 주문 ====================
+
+    /**
+     * 지정가 매수 (사용자별)
+     * @param market 마켓 (예: KRW-BTC)
+     * @param volume 매수 수량
+     * @param price 지정가 (KRW)
+     */
+    public OrderResponse buyLimitOrder(User user, String market, double volume, double price) {
+        // 업비트 가격 단위 맞춤 (호가 단위)
+        double adjustedPrice = adjustPriceUnit(price);
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("market", market);
+        params.put("side", "bid");
+        params.put("ord_type", "limit");
+        params.put("volume", String.valueOf(volume));
+        params.put("price", String.valueOf((long) adjustedPrice));
+
+        String url = API_URL + "/orders";
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(user, params));
+
+        try {
+            ResponseEntity<OrderResponse> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.POST,
+                    entity,
+                    OrderResponse.class
+            );
+            log.info("[지정가 매수] 마켓: {}, 수량: {}, 가격: {}", market, volume, adjustedPrice);
+            return response.getBody();
+        } catch (Exception e) {
+            log.error("[지정가 매수 실패] 마켓: {}, 오류: {}", market, e.getMessage());
+            throw e;
+        }
+    }
+
+    /**
+     * 지정가 매도 (사용자별)
+     * @param market 마켓 (예: KRW-BTC)
+     * @param volume 매도 수량
+     * @param price 지정가 (KRW)
+     */
+    public OrderResponse sellLimitOrder(User user, String market, double volume, double price) {
+        // 업비트 가격 단위 맞춤 (호가 단위)
+        double adjustedPrice = adjustPriceUnit(price);
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("market", market);
+        params.put("side", "ask");
+        params.put("ord_type", "limit");
+        params.put("volume", String.valueOf(volume));
+        params.put("price", String.valueOf((long) adjustedPrice));
+
+        String url = API_URL + "/orders";
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(params, createAuthHeaders(user, params));
+
+        try {
+            ResponseEntity<OrderResponse> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.POST,
+                    entity,
+                    OrderResponse.class
+            );
+            log.info("[지정가 매도] 마켓: {}, 수량: {}, 가격: {}", market, volume, adjustedPrice);
+            return response.getBody();
+        } catch (Exception e) {
+            log.error("[지정가 매도 실패] 마켓: {}, 오류: {}", market, e.getMessage());
+            throw e;
+        }
+    }
+
+    /**
+     * 지정가 매수 + 체결 대기 (타임아웃 시 취소 후 시장가 전환)
+     * @param timeoutMs 체결 대기 시간 (밀리초)
+     * @param fallbackToMarket 미체결 시 시장가 전환 여부
+     */
+    public OrderResponse buyLimitOrderWithTimeout(User user, String market, double volume, double price,
+                                                   long timeoutMs, boolean fallbackToMarket) {
+        OrderResponse order = buyLimitOrder(user, market, volume, price);
+        if (order == null || order.getUuid() == null) {
+            return order;
+        }
+
+        long startTime = System.currentTimeMillis();
+        OrderResponse lastOrder = null;
+
+        while (System.currentTimeMillis() - startTime < timeoutMs) {
+            try {
+                Thread.sleep(ORDER_CHECK_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+
+            lastOrder = getOrder(user, order.getUuid());
+            if (lastOrder == null) continue;
+
+            if ("done".equals(lastOrder.getState())) {
+                log.info("[지정가 매수 체결완료] UUID: {}, 체결량: {}", order.getUuid(), lastOrder.getExecutedVolume());
+                return lastOrder;
+            } else if ("cancel".equals(lastOrder.getState())) {
+                log.warn("[지정가 매수 취소됨] UUID: {}", order.getUuid());
+                return lastOrder;
+            }
+        }
+
+        // 타임아웃 - 미체결 처리
+        log.warn("[지정가 매수 타임아웃] UUID: {}, 경과시간: {}ms", order.getUuid(), timeoutMs);
+
+        // 미체결 주문 취소
+        cancelOrder(user, order.getUuid());
+
+        // 시장가 전환
+        if (fallbackToMarket) {
+            double remainingVolume = volume;
+            if (lastOrder != null && lastOrder.getExecutedVolume() != null) {
+                remainingVolume = volume - Double.parseDouble(lastOrder.getExecutedVolume());
+            }
+            if (remainingVolume > 0) {
+                double orderAmount = remainingVolume * price;
+                log.info("[시장가 전환] 미체결 수량: {}, 주문금액: {}", remainingVolume, orderAmount);
+                return buyMarketOrder(user, market, orderAmount);
+            }
+        }
+
+        return lastOrder;
+    }
+
+    /**
+     * 지정가 매도 + 체결 대기 (타임아웃 시 취소 후 시장가 전환)
+     */
+    public OrderResponse sellLimitOrderWithTimeout(User user, String market, double volume, double price,
+                                                    long timeoutMs, boolean fallbackToMarket) {
+        OrderResponse order = sellLimitOrder(user, market, volume, price);
+        if (order == null || order.getUuid() == null) {
+            return order;
+        }
+
+        long startTime = System.currentTimeMillis();
+        OrderResponse lastOrder = null;
+
+        while (System.currentTimeMillis() - startTime < timeoutMs) {
+            try {
+                Thread.sleep(ORDER_CHECK_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+
+            lastOrder = getOrder(user, order.getUuid());
+            if (lastOrder == null) continue;
+
+            if ("done".equals(lastOrder.getState())) {
+                log.info("[지정가 매도 체결완료] UUID: {}, 체결량: {}", order.getUuid(), lastOrder.getExecutedVolume());
+                return lastOrder;
+            } else if ("cancel".equals(lastOrder.getState())) {
+                log.warn("[지정가 매도 취소됨] UUID: {}", order.getUuid());
+                return lastOrder;
+            }
+        }
+
+        // 타임아웃 - 미체결 처리
+        log.warn("[지정가 매도 타임아웃] UUID: {}, 경과시간: {}ms", order.getUuid(), timeoutMs);
+
+        // 미체결 주문 취소
+        cancelOrder(user, order.getUuid());
+
+        // 시장가 전환
+        if (fallbackToMarket) {
+            double remainingVolume = volume;
+            if (lastOrder != null && lastOrder.getExecutedVolume() != null) {
+                remainingVolume = volume - Double.parseDouble(lastOrder.getExecutedVolume());
+            }
+            if (remainingVolume > 0) {
+                log.info("[시장가 전환] 미체결 수량: {}", remainingVolume);
+                return sellMarketOrder(user, market, remainingVolume);
+            }
+        }
+
+        return lastOrder;
+    }
+
+    /**
+     * 업비트 호가 단위에 맞춰 가격 조정
+     * - 2,000,000원 이상: 1,000원 단위
+     * - 1,000,000원 이상: 500원 단위
+     * - 500,000원 이상: 100원 단위
+     * - 100,000원 이상: 50원 단위
+     * - 10,000원 이상: 10원 단위
+     * - 1,000원 이상: 5원 단위
+     * - 100원 이상: 1원 단위
+     * - 10원 이상: 0.1원 단위
+     * - 1원 이상: 0.01원 단위
+     * - 1원 미만: 0.001원 단위
+     */
+    private double adjustPriceUnit(double price) {
+        if (price >= 2_000_000) {
+            return Math.floor(price / 1000) * 1000;
+        } else if (price >= 1_000_000) {
+            return Math.floor(price / 500) * 500;
+        } else if (price >= 500_000) {
+            return Math.floor(price / 100) * 100;
+        } else if (price >= 100_000) {
+            return Math.floor(price / 50) * 50;
+        } else if (price >= 10_000) {
+            return Math.floor(price / 10) * 10;
+        } else if (price >= 1_000) {
+            return Math.floor(price / 5) * 5;
+        } else if (price >= 100) {
+            return Math.floor(price);
+        } else if (price >= 10) {
+            return Math.floor(price * 10) / 10;
+        } else if (price >= 1) {
+            return Math.floor(price * 100) / 100;
+        } else {
+            return Math.floor(price * 1000) / 1000;
+        }
+    }
+
     // ==================== 주문 체결 확인 로직 ====================
 
     /**
