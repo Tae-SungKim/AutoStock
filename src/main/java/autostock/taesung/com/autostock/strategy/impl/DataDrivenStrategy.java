@@ -60,18 +60,47 @@ public class DataDrivenStrategy implements TradingStrategy {
     public void init() {
         // 초기화 시 기본 파라미터 설정 (최적화는 별도 트리거)
         globalParams = StrategyOptimizerService.OptimizedParams.builder()
+
+                // 기본 볼린저밴드
                 .bollingerPeriod(20)
                 .bollingerMultiplier(2.0)
+                // RSI
                 .rsiPeriod(14)
                 .rsiBuyThreshold(30)
                 .rsiSellThreshold(70)
-                .volumeIncreaseRate(100)
-                .stopLossRate(-2.5)
-                .takeProfitRate(3.0)
-                .trailingStopRate(1.5)
-                .bandWidthMinPercent(0.8)
-                .upperWickMaxRatio(0.45)
+                // 거래량
+                .volumeIncreaseRate(120)
                 .minTradeAmount(50_000_000)
+                // 손절/익절 기본
+                .stopLossRate(-2.5)
+                .takeProfitRate(2.0)
+                .trailingStopRate(1.5)
+                // ATR 기반
+                .stopLossAtrMult(2.0)
+                .takeProfitAtrMult(2.5)
+                .trailingStopAtrMult(1.5)
+                .maxStopLossRate(0.03)
+                // 캔들 기반
+                .stopLossCooldownCandles(5)
+                .minHoldCandles(3)
+                // 슬리피지/수수료
+                .totalCost(0.002)
+                .minProfitRate(0.006)
+                // Fast Breakout
+                .fastBreakoutUpperMult(1.002)
+                .fastBreakoutVolumeMult(2.5)
+                .fastBreakoutRsiMin(55.0)
+                // 급등 차단/추격 방지
+                .highVolumeThreshold(2.0)
+                .chasePreventionRate(0.035)
+                .bandWidthMinPercent(0.8)
+                .atrCandleMoveMult(0.8)
+                // 성과 지표
+                .expectedWinRate(50)
+                .expectedProfitRate(0)
+                .totalSignals(0)
+                .winCount(0)
+                .lossCount(0)
                 .build();
         log.info("[DataDrivenStrategy] 초기화 완료 (기본 파라미터)");
     }
@@ -123,19 +152,73 @@ public class DataDrivenStrategy implements TradingStrategy {
         StrategyOptimizerService.OptimizedParams.OptimizedParamsBuilder builder =
                 StrategyOptimizerService.OptimizedParams.builder();
 
+
         // 기존 값 복사 후 새 값으로 덮어쓰기
-        builder.bollingerPeriod(getIntParam(params, "bollingerPeriod", globalParams.getBollingerPeriod()));
-        builder.bollingerMultiplier(getDoubleParam(params, "bollingerMultiplier", globalParams.getBollingerMultiplier()));
-        builder.rsiPeriod(getIntParam(params, "rsiPeriod", globalParams.getRsiPeriod()));
-        builder.rsiBuyThreshold(getDoubleParam(params, "rsiBuyThreshold", globalParams.getRsiBuyThreshold()));
-        builder.rsiSellThreshold(getDoubleParam(params, "rsiSellThreshold", globalParams.getRsiSellThreshold()));
-        builder.volumeIncreaseRate(getDoubleParam(params, "volumeIncreaseRate", globalParams.getVolumeIncreaseRate()));
-        builder.stopLossRate(getDoubleParam(params, "stopLossRate", globalParams.getStopLossRate()));
-        builder.takeProfitRate(getDoubleParam(params, "takeProfitRate", globalParams.getTakeProfitRate()));
-        builder.trailingStopRate(getDoubleParam(params, "trailingStopRate", globalParams.getTrailingStopRate()));
-        builder.bandWidthMinPercent(getDoubleParam(params, "bandWidthMinPercent", globalParams.getBandWidthMinPercent()));
-        builder.upperWickMaxRatio(getDoubleParam(params, "upperWickMaxRatio", globalParams.getUpperWickMaxRatio()));
-        builder.minTradeAmount(getDoubleParam(params, "minTradeAmount", globalParams.getMinTradeAmount()));
+        // 기본 볼린저밴드
+        builder.bollingerPeriod(
+                getIntParam(params, "bollingerPeriod", globalParams.getBollingerPeriod()));
+        builder.bollingerMultiplier(
+                getDoubleParam(params, "bollingerMultiplier", globalParams.getBollingerMultiplier()));
+
+// RSI
+        builder.rsiPeriod(
+                getIntParam(params, "rsiPeriod", globalParams.getRsiPeriod()));
+        builder.rsiBuyThreshold(
+                getDoubleParam(params, "rsiBuyThreshold", globalParams.getRsiBuyThreshold()));
+        builder.rsiSellThreshold(
+                getDoubleParam(params, "rsiSellThreshold", globalParams.getRsiSellThreshold()));
+
+// 거래량
+        builder.volumeIncreaseRate(
+                getDoubleParam(params, "volumeIncreaseRate", globalParams.getVolumeIncreaseRate()));
+
+// 손절 / 익절 기본
+        builder.stopLossRate(
+                getDoubleParam(params, "stopLossRate", globalParams.getStopLossRate()));
+        builder.takeProfitRate(
+                getDoubleParam(params, "takeProfitRate", globalParams.getTakeProfitRate()));
+        builder.trailingStopRate(
+                getDoubleParam(params, "trailingStopRate", globalParams.getTrailingStopRate()));
+
+// ATR 기반
+        builder.stopLossAtrMult(
+                getDoubleParam(params, "stopLossAtrMult", globalParams.getStopLossAtrMult()));
+        builder.takeProfitAtrMult(
+                getDoubleParam(params, "takeProfitAtrMult", globalParams.getTakeProfitAtrMult()));
+        builder.trailingStopAtrMult(
+                getDoubleParam(params, "trailingStopAtrMult", globalParams.getTrailingStopAtrMult()));
+        builder.maxStopLossRate(
+                getDoubleParam(params, "maxStopLossRate", globalParams.getMaxStopLossRate()));
+
+// 캔들 기반
+        builder.stopLossCooldownCandles(
+                getIntParam(params, "stopLossCooldownCandles", globalParams.getStopLossCooldownCandles()));
+        builder.minHoldCandles(
+                getIntParam(params, "minHoldCandles", globalParams.getMinHoldCandles()));
+
+// 슬리피지 / 수수료
+        builder.totalCost(
+                getDoubleParam(params, "totalCost", globalParams.getTotalCost()));
+        builder.minProfitRate(
+                getDoubleParam(params, "minProfitRate", globalParams.getMinProfitRate()));
+
+// Fast Breakout
+        builder.fastBreakoutUpperMult(
+                getDoubleParam(params, "fastBreakoutUpperMult", globalParams.getFastBreakoutUpperMult()));
+        builder.fastBreakoutVolumeMult(
+                getDoubleParam(params, "fastBreakoutVolumeMult", globalParams.getFastBreakoutVolumeMult()));
+        builder.fastBreakoutRsiMin(
+                getDoubleParam(params, "fastBreakoutRsiMin", globalParams.getFastBreakoutRsiMin()));
+
+// 급등 차단 / 추격 방지
+        builder.highVolumeThreshold(
+                getDoubleParam(params, "highVolumeThreshold", globalParams.getHighVolumeThreshold()));
+        builder.chasePreventionRate(
+                getDoubleParam(params, "chasePreventionRate", globalParams.getChasePreventionRate()));
+        builder.bandWidthMinPercent(
+                getDoubleParam(params, "bandWidthMinPercent", globalParams.getBandWidthMinPercent()));
+        builder.atrCandleMoveMult(
+                getDoubleParam(params, "atrCandleMoveMult", globalParams.getAtrCandleMoveMult()));
 
         globalParams = builder.build();
         log.info("[DataDrivenStrategy] 파라미터 수동 설정 완료: {}", getCurrentParams("GLOBAL"));
@@ -307,11 +390,6 @@ public class DataDrivenStrategy implements TradingStrategy {
                 return 0;
             }
 
-            // 윗꼬리 필터
-            double upperWickRatio = (high - currentPrice) / (high - low + 1e-9);
-            if (upperWickRatio > params.getUpperWickMaxRatio()) {
-                return 0;
-            }
 
             // 거래대금 필터
             double minTradeAmount = getMinTradeAmountByTime();

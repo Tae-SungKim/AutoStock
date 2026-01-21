@@ -32,34 +32,57 @@ public class StrategyOptimizerService {
     @Data
     @Builder
     public static class OptimizedParams {
-        // 볼린저 밴드
+        // ===== 볼린저 밴드 =====
         private int bollingerPeriod;
         private double bollingerMultiplier;
 
-        // RSI
+        // ===== RSI =====
         private int rsiPeriod;
-        private double rsiBuyThreshold;
-        private double rsiSellThreshold;
+        private double rsiBuyThreshold;      // rsi.oversold
+        private double rsiSellThreshold;     // rsi.overbought
 
-        // 거래량
-        private double volumeIncreaseRate;
+        // ===== 거래량 =====
+        private double volumeIncreaseRate;   // volume.threshold
         private double minTradeAmount;
 
-        // 손절/익절
+        // ===== 손절/익절 기본 =====
         private double stopLossRate;
         private double takeProfitRate;
         private double trailingStopRate;
 
-        // 기타
-        private double bandWidthMinPercent;
-        private double upperWickMaxRatio;
+        // ===== ATR 기반 손익 =====
+        private double stopLossAtrMult;
+        private double takeProfitAtrMult;
+        private double trailingStopAtrMult;
+        private double maxStopLossRate;
 
-        // 성과 지표
+        // ===== 캔들 기반 =====
+        private int stopLossCooldownCandles;
+        private int minHoldCandles;
+
+        // ===== 슬리피지/수수료 =====
+        private double totalCost;
+        private double minProfitRate;
+
+        // ===== Fast Breakout =====
+        private double fastBreakoutUpperMult;
+        private double fastBreakoutVolumeMult;
+        private double fastBreakoutRsiMin;
+
+        // ===== 급등 차단 및 추격 매수 방지 =====
+        private double highVolumeThreshold;
+        private double chasePreventionRate;
+        private double bandWidthMinPercent;
+        private double atrCandleMoveMult;
+
+        // ===== 성과 지표 =====
         private double expectedWinRate;
         private double expectedProfitRate;
         private int totalSignals;
         private int winCount;
         private int lossCount;
+        private double maxDrawdown;
+        private double sharpeRatio;
     }
 
     /**
@@ -97,6 +120,8 @@ public class StrategyOptimizerService {
 
     /**
      * 전체 데이터 기반 최적 파라미터 도출 (병렬 처리)
+     * - 새로운 BollingerBandStrategy 파라미터 반영
+     * - Fast Breakout, ATR 기반 손익, 추격 매수 방지 등 포함
      */
     public OptimizedParams optimizeStrategy() {
         long startTime = System.currentTimeMillis();
@@ -126,17 +151,42 @@ public class StrategyOptimizerService {
             return getDefaultParams();
         }
 
-        // 2️⃣ 파라미터 조합 생성
-        int[] bollingerPeriods = {15, 20, 25};
-        double[] bollingerMultipliers = {1.8, 2.0, 2.2};
-        int[] rsiPeriods = {10, 14, 18};
-        double[] rsiBuyThresholds = {25, 30, 35};
-        double[] rsiSellThresholds = {65, 70, 75};
-        double[] volumeRates = {80, 100, 120};
-        double[] stopLossRates = {-2.0, -2.5, -3.0};
-        double[] takeProfitRates = {2.0, 3.0, 4.0};
+        // 2️⃣ 파라미터 조합 생성 (확장된 파라미터)
+        // ===== 기본 볼린저밴드 =====
+        int[] bollingerPeriods = {15, 18, 20, 22, 25};
+        double[] bollingerMultipliers = {1.7, 1.8, 2.0, 2.2, 2.3};
 
+        // ===== RSI =====
+        int[] rsiPeriods = {10, 12, 14, 16, 18};
+        double[] rsiBuyThresholds = {25, 28, 30, 33, 35};
+        double[] rsiSellThresholds = {65, 68, 70, 73, 75};
+
+        // ===== 거래량 =====
+        double[] volumeRates = {80, 100, 120, 140};
+
+        // ===== 손절/익절 기본 =====
+        double[] stopLossRates = {-1.5, -2.0, -2.5, -3.0, -3.5};
+        double[] takeProfitRates = {1.5, 2.0, 2.5, 3.0, 4.0};
+
+        // ===== ATR 기반 =====
+        double[] stopLossAtrMults = {1.5, 2.0, 2.5};
+        double[] takeProfitAtrMults = {2.0, 2.5, 3.0};
+        double[] trailingStopAtrMults = {1.0, 1.5, 2.0};
+
+        // ===== Fast Breakout =====
+        double[] fastBreakoutUpperMults = {1.001, 1.002, 1.003};
+        double[] fastBreakoutVolumeMults = {2.0, 2.5, 3.0};
+        double[] fastBreakoutRsiMins = {50, 55, 60};
+
+        // ===== 급등 차단/추격 방지 =====
+        double[] highVolumeThresholds = {1.5, 2.0, 2.5};
+        double[] chasePreventionRates = {0.025, 0.035, 0.045};
+        double[] bandWidthMinPercents = {0.6, 0.8, 1.0};
+
+        // 조합 생성 (핵심 파라미터 중심으로 조합)
         List<Map<String, Object>> combinations = new ArrayList<>();
+
+        // 첫 번째 레벨: 기본 파라미터 (5x5x5x5x5x4x5x5 = 125,000개)
         for (int bp : bollingerPeriods) {
             for (double bm : bollingerMultipliers) {
                 for (int rp : rsiPeriods) {
@@ -145,7 +195,23 @@ public class StrategyOptimizerService {
                             for (double vr : volumeRates) {
                                 for (double sl : stopLossRates) {
                                     for (double tp : takeProfitRates) {
+                                        // ATR 기반 파라미터 (대표값 사용 - 조합 수 제한)
+                                        double slAtr = 2.0;
+                                        double tpAtr = 2.5;
+                                        double tsAtr = 1.5;
+
+                                        // Fast Breakout 파라미터 (대표값)
+                                        double fbUpper = 1.002;
+                                        double fbVol = 2.5;
+                                        double fbRsi = 55.0;
+
+                                        // 급등 차단/추격 방지 (대표값)
+                                        double hvThreshold = 2.0;
+                                        double cpRate = 0.035;
+                                        double bwMin = 0.8;
+
                                         Map<String, Object> params = new HashMap<>();
+                                        // 기본 파라미터
                                         params.put("bollingerPeriod", bp);
                                         params.put("bollingerMultiplier", bm);
                                         params.put("rsiPeriod", rp);
@@ -154,6 +220,68 @@ public class StrategyOptimizerService {
                                         params.put("volumeRate", vr);
                                         params.put("stopLossRate", sl);
                                         params.put("takeProfitRate", tp);
+
+                                        // ATR 기반
+                                        params.put("stopLossAtrMult", slAtr);
+                                        params.put("takeProfitAtrMult", tpAtr);
+                                        params.put("trailingStopAtrMult", tsAtr);
+
+                                        // Fast Breakout
+                                        params.put("fastBreakoutUpperMult", fbUpper);
+                                        params.put("fastBreakoutVolumeMult", fbVol);
+                                        params.put("fastBreakoutRsiMin", fbRsi);
+
+                                        // 급등 차단/추격 방지
+                                        params.put("highVolumeThreshold", hvThreshold);
+                                        params.put("chasePreventionRate", cpRate);
+                                        params.put("bandWidthMinPercent", bwMin);
+
+                                        combinations.add(params);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 두 번째 레벨: ATR/Fast Breakout/급등 차단 세부 조합 (최적 기본값 기반)
+        // 기본값 고정하고 ATR, Fast Breakout, 급등차단 조합만 테스트
+        for (double slAtr : stopLossAtrMults) {
+            for (double tpAtr : takeProfitAtrMults) {
+                for (double tsAtr : trailingStopAtrMults) {
+                    for (double fbUpper : fastBreakoutUpperMults) {
+                        for (double fbVol : fastBreakoutVolumeMults) {
+                            for (double fbRsi : fastBreakoutRsiMins) {
+                                for (double hvThreshold : highVolumeThresholds) {
+                                    for (double cpRate : chasePreventionRates) {
+                                        Map<String, Object> params = new HashMap<>();
+                                        // 기본값 고정
+                                        params.put("bollingerPeriod", 20);
+                                        params.put("bollingerMultiplier", 2.0);
+                                        params.put("rsiPeriod", 14);
+                                        params.put("rsiBuyThreshold", 30.0);
+                                        params.put("rsiSellThreshold", 70.0);
+                                        params.put("volumeRate", 120.0);
+                                        params.put("stopLossRate", -2.5);
+                                        params.put("takeProfitRate", 2.0);
+
+                                        // ATR 기반
+                                        params.put("stopLossAtrMult", slAtr);
+                                        params.put("takeProfitAtrMult", tpAtr);
+                                        params.put("trailingStopAtrMult", tsAtr);
+
+                                        // Fast Breakout
+                                        params.put("fastBreakoutUpperMult", fbUpper);
+                                        params.put("fastBreakoutVolumeMult", fbVol);
+                                        params.put("fastBreakoutRsiMin", fbRsi);
+
+                                        // 급등 차단/추격 방지
+                                        params.put("highVolumeThreshold", hvThreshold);
+                                        params.put("chasePreventionRate", cpRate);
+                                        params.put("bandWidthMinPercent", 0.8);
+
                                         combinations.add(params);
                                     }
                                 }
@@ -165,7 +293,7 @@ public class StrategyOptimizerService {
         }
 
         int totalCombinations = combinations.size();
-        log.info("테스트할 파라미터 조합 수: {}", totalCombinations);
+        log.info("테스트할 파라미터 조합 수: {} (기본 + ATR/FB/급등차단 조합)", totalCombinations);
 
         // 3️⃣ 시뮬레이션 병렬 실행 (ForkJoinPool)
         AtomicInteger progress = new AtomicInteger(0);
@@ -178,11 +306,11 @@ public class StrategyOptimizerService {
             results = customPool.submit(() ->
                 combinations.parallelStream()
                     .map(params -> {
-                        SimulationResult result = runSimulation(marketCandles, params);
+                        SimulationResult result = runSimulationExtended(marketCandles, params);
 
-                        // 진행률 로깅 (10% 단위)
+                        // 진행률 로깅 (5% 단위)
                         int current = progress.incrementAndGet();
-                        if (current % (totalCombinations / 10 + 1) == 0) {
+                        if (current % (totalCombinations / 20 + 1) == 0) {
                             log.info("진행률: {}% ({}/{})",
                                     current * 100 / totalCombinations, current, totalCombinations);
                         }
@@ -206,9 +334,10 @@ public class StrategyOptimizerService {
         log.info("시뮬레이션 완료: {} 조합 테스트, {} 유효 결과 ({}ms)",
                 totalCombinations, results.size(), elapsed);
 
-        // 4️⃣ 최적 파라미터 선택 (수익률 * 승률 기준)
+        // 4️⃣ 최적 파라미터 선택 (수익률 * 승률 - MDD 페널티 기준)
         SimulationResult best = results.stream()
-                .max(Comparator.comparingDouble(r -> r.getTotalReturn() * r.getWinRate()))
+                .max(Comparator.comparingDouble(r ->
+                        r.getTotalReturn() * r.getWinRate() - r.getMaxDrawdown() * 0.1))
                 .orElse(null);
 
         if (best == null) {
@@ -217,30 +346,56 @@ public class StrategyOptimizerService {
         }
 
         log.info("=== 최적 파라미터 도출 완료 ({} ms) ===", System.currentTimeMillis() - startTime);
-        log.info("총 수익률: {}%, 승률: {}%, 거래 수: {}",
+        log.info("총 수익률: {}%, 승률: {}%, MDD: {}%, 거래 수: {}",
                 String.format("%.2f", best.getTotalReturn()),
                 String.format("%.2f", best.getWinRate() * 100),
+                String.format("%.2f", best.getMaxDrawdown()),
                 best.getTotalTrades());
 
         Map<String, Object> p = best.getParams();
         return OptimizedParams.builder()
+                // 기본 볼린저밴드
                 .bollingerPeriod((int) p.get("bollingerPeriod"))
                 .bollingerMultiplier((double) p.get("bollingerMultiplier"))
+                // RSI
                 .rsiPeriod((int) p.get("rsiPeriod"))
                 .rsiBuyThreshold((double) p.get("rsiBuyThreshold"))
                 .rsiSellThreshold((double) p.get("rsiSellThreshold"))
+                // 거래량
                 .volumeIncreaseRate((double) p.get("volumeRate"))
+                .minTradeAmount(50_000_000)
+                // 손절/익절 기본
                 .stopLossRate((double) p.get("stopLossRate"))
                 .takeProfitRate((double) p.get("takeProfitRate"))
                 .trailingStopRate(1.5)
-                .bandWidthMinPercent(0.8)
-                .upperWickMaxRatio(0.45)
-                .minTradeAmount(50_000_000)
+                // ATR 기반
+                .stopLossAtrMult((double) p.get("stopLossAtrMult"))
+                .takeProfitAtrMult((double) p.get("takeProfitAtrMult"))
+                .trailingStopAtrMult((double) p.get("trailingStopAtrMult"))
+                .maxStopLossRate(0.03)
+                // 캔들 기반
+                .stopLossCooldownCandles(5)
+                .minHoldCandles(3)
+                // 슬리피지/수수료
+                .totalCost(0.002)
+                .minProfitRate(0.006)
+                // Fast Breakout
+                .fastBreakoutUpperMult((double) p.get("fastBreakoutUpperMult"))
+                .fastBreakoutVolumeMult((double) p.get("fastBreakoutVolumeMult"))
+                .fastBreakoutRsiMin((double) p.get("fastBreakoutRsiMin"))
+                // 급등 차단/추격 방지
+                .highVolumeThreshold((double) p.get("highVolumeThreshold"))
+                .chasePreventionRate((double) p.get("chasePreventionRate"))
+                .bandWidthMinPercent((double) p.getOrDefault("bandWidthMinPercent", 0.8))
+                .atrCandleMoveMult(0.8)
+                // 성과 지표
                 .expectedWinRate(best.getWinRate() * 100)
                 .expectedProfitRate(best.getTotalReturn())
                 .totalSignals(best.getTotalTrades())
                 .winCount(best.getWins())
                 .lossCount(best.getLosses())
+                .maxDrawdown(best.getMaxDrawdown())
+                .sharpeRatio(best.getSharpeRatio())
                 .build();
     }
 
@@ -265,18 +420,41 @@ public class StrategyOptimizerService {
         PatternAnalysis analysis = analyzePatterns(candles);
 
         return OptimizedParams.builder()
+                // 기본 볼린저밴드
                 .bollingerPeriod(analysis.optimalBollingerPeriod)
                 .bollingerMultiplier(analysis.optimalBollingerMult)
+                // RSI
                 .rsiPeriod(analysis.optimalRsiPeriod)
                 .rsiBuyThreshold(analysis.optimalRsiBuy)
                 .rsiSellThreshold(analysis.optimalRsiSell)
+                // 거래량
                 .volumeIncreaseRate(analysis.optimalVolumeRate)
+                .minTradeAmount(50_000_000)
+                // 손절/익절 기본
                 .stopLossRate(analysis.optimalStopLoss)
                 .takeProfitRate(analysis.optimalTakeProfit)
                 .trailingStopRate(1.5)
+                // ATR 기반
+                .stopLossAtrMult(2.0)
+                .takeProfitAtrMult(2.5)
+                .trailingStopAtrMult(1.5)
+                .maxStopLossRate(0.03)
+                // 캔들 기반
+                .stopLossCooldownCandles(5)
+                .minHoldCandles(3)
+                // 슬리피지/수수료
+                .totalCost(0.002)
+                .minProfitRate(0.006)
+                // Fast Breakout
+                .fastBreakoutUpperMult(1.002)
+                .fastBreakoutVolumeMult(2.5)
+                .fastBreakoutRsiMin(55.0)
+                // 급등 차단/추격 방지
+                .highVolumeThreshold(2.0)
+                .chasePreventionRate(0.035)
                 .bandWidthMinPercent(0.8)
-                .upperWickMaxRatio(0.45)
-                .minTradeAmount(50_000_000)
+                .atrCandleMoveMult(0.8)
+                // 성과 지표
                 .expectedWinRate(analysis.estimatedWinRate)
                 .expectedProfitRate(analysis.estimatedProfitRate)
                 .totalSignals(analysis.signalCount)
@@ -286,7 +464,269 @@ public class StrategyOptimizerService {
     }
 
     /**
-     * 시뮬레이션 실행 (캐싱된 데이터 사용)
+     * 확장된 시뮬레이션 실행 (새 파라미터 포함)
+     * - ATR 기반 손익, Fast Breakout, 추격 매수 방지 등 반영
+     */
+    private SimulationResult runSimulationExtended(Map<String, List<CandleData>> marketCandles, Map<String, Object> params) {
+        int totalTrades = 0;
+        int wins = 0;
+        double totalReturn = 0;
+        double maxDrawdown = 0;
+        double peak = 100;
+        double equity = 100;
+        List<Double> returns = new ArrayList<>();
+
+        // 기본 파라미터
+        int bp = (int) params.get("bollingerPeriod");
+        double bm = (double) params.get("bollingerMultiplier");
+        int rp = (int) params.get("rsiPeriod");
+        double rbt = (double) params.get("rsiBuyThreshold");
+        double rst = (double) params.get("rsiSellThreshold");
+        double vr = (double) params.get("volumeRate");
+        double sl = (double) params.get("stopLossRate");
+        double tp = (double) params.get("takeProfitRate");
+
+        // ATR 기반 파라미터
+        double slAtrMult = (double) params.get("stopLossAtrMult");
+        double tpAtrMult = (double) params.get("takeProfitAtrMult");
+        double tsAtrMult = (double) params.get("trailingStopAtrMult");
+
+        // Fast Breakout 파라미터
+        double fbUpperMult = (double) params.get("fastBreakoutUpperMult");
+        double fbVolMult = (double) params.get("fastBreakoutVolumeMult");
+        double fbRsiMin = (double) params.get("fastBreakoutRsiMin");
+
+        // 급등 차단/추격 방지
+        double hvThreshold = (double) params.get("highVolumeThreshold");
+        double cpRate = (double) params.get("chasePreventionRate");
+        double bwMin = (double) params.getOrDefault("bandWidthMinPercent", 0.8);
+
+        for (Map.Entry<String, List<CandleData>> entry : marketCandles.entrySet()) {
+            List<CandleData> candles = entry.getValue();
+
+            if (candles.size() < bp + rp + 10) continue;
+
+            List<TradeResult> trades = simulateTradesExtended(candles, bp, bm, rp, rbt, rst, vr, sl, tp,
+                    slAtrMult, tpAtrMult, tsAtrMult, fbUpperMult, fbVolMult, fbRsiMin, hvThreshold, cpRate, bwMin);
+
+            for (TradeResult trade : trades) {
+                totalTrades++;
+                totalReturn += trade.getProfitRate();
+                returns.add(trade.getProfitRate());
+                equity *= (1 + trade.getProfitRate() / 100);
+
+                if (equity > peak) peak = equity;
+                double drawdown = (peak - equity) / peak * 100;
+                if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+
+                if (trade.isWin()) wins++;
+            }
+        }
+
+        // Sharpe Ratio 계산 (간단 버전)
+        double sharpeRatio = 0;
+        if (!returns.isEmpty() && returns.size() > 1) {
+            double avgReturn = returns.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+            double stdDev = Math.sqrt(returns.stream()
+                    .mapToDouble(r -> Math.pow(r - avgReturn, 2))
+                    .average().orElse(1));
+            if (stdDev > 0) {
+                sharpeRatio = avgReturn / stdDev;
+            }
+        }
+
+        return SimulationResult.builder()
+                .totalReturn(totalReturn)
+                .winRate(totalTrades > 0 ? (double) wins / totalTrades : 0)
+                .totalTrades(totalTrades)
+                .wins(wins)
+                .losses(totalTrades - wins)
+                .maxDrawdown(maxDrawdown)
+                .sharpeRatio(sharpeRatio)
+                .params(params)
+                .build();
+    }
+
+    /**
+     * 확장된 거래 시뮬레이션 (새 파라미터 포함)
+     */
+    private List<TradeResult> simulateTradesExtended(List<CandleData> candles,
+            int bp, double bm, int rp, double rbt, double rst, double vr, double sl, double tp,
+            double slAtrMult, double tpAtrMult, double tsAtrMult,
+            double fbUpperMult, double fbVolMult, double fbRsiMin,
+            double hvThreshold, double cpRate, double bwMin) {
+
+        List<TradeResult> trades = new ArrayList<>();
+        boolean holding = false;
+        double buyPrice = 0;
+        double highestPrice = 0;
+        int holdingCandles = 0;
+        int cooldownCandles = 0;  // 손절 후 쿨다운
+
+        for (int i = Math.max(bp, rp) + 5; i < candles.size(); i++) {
+            CandleData current = candles.get(i);
+            double currentPrice = current.getTradePrice().doubleValue();
+            double openPrice = current.getOpeningPrice().doubleValue();
+
+            // 쿨다운 감소
+            if (cooldownCandles > 0) cooldownCandles--;
+
+            if (holding) {
+                holdingCandles++;
+                if (currentPrice > highestPrice) highestPrice = currentPrice;
+
+                // ATR 계산
+                double atr = calculateATR(candles, i, rp);
+
+                // 실제 수익률 (비용 0.2% 반영)
+                double realProfitRate = ((currentPrice * 0.998) - (buyPrice * 1.002)) / (buyPrice * 1.002) * 100;
+
+                // ATR 기반 손절가 계산 (최대 -3% 제한)
+                double atrStopLoss = buyPrice - atr * slAtrMult;
+                double fixedStopLoss = buyPrice * (1 + sl / 100);
+                double maxStopLoss = buyPrice * 0.97;  // -3% 최대
+                double stopLossPrice = Math.max(maxStopLoss, Math.max(fixedStopLoss, atrStopLoss));
+
+                // ATR 기반 익절가
+                double atrTakeProfit = buyPrice + atr * tpAtrMult;
+                double fixedTakeProfit = buyPrice * (1 + tp / 100);
+                double takeProfitPrice = Math.min(fixedTakeProfit, atrTakeProfit);
+
+                // 트레일링 스탑
+                double trailingStop = highestPrice - atr * tsAtrMult;
+
+                // 손절
+                if (holdingCandles >= 3 && currentPrice <= stopLossPrice) {
+                    trades.add(TradeResult.builder()
+                            .buyPrice(buyPrice).sellPrice(currentPrice)
+                            .profitRate(realProfitRate).isWin(false)
+                            .holdingCandles(holdingCandles).build());
+                    holding = false;
+                    cooldownCandles = 5;  // 손절 후 5캔들 쿨다운
+                    continue;
+                }
+
+                // 익절 (최소 수익률 0.6% 이상)
+                double rsi = calculateRSI(candles, i, rp);
+                if (currentPrice >= takeProfitPrice && rsi > rst && realProfitRate >= 0.6) {
+                    trades.add(TradeResult.builder()
+                            .buyPrice(buyPrice).sellPrice(currentPrice)
+                            .profitRate(realProfitRate).isWin(true)
+                            .holdingCandles(holdingCandles).build());
+                    holding = false;
+                    continue;
+                }
+
+                // 트레일링 스탑
+                if (holdingCandles >= 3 && currentPrice <= trailingStop && highestPrice > buyPrice * 1.01) {
+                    trades.add(TradeResult.builder()
+                            .buyPrice(buyPrice).sellPrice(currentPrice)
+                            .profitRate(realProfitRate).isWin(realProfitRate > 0)
+                            .holdingCandles(holdingCandles).build());
+                    holding = false;
+                }
+            } else {
+                // 쿨다운 중이면 진입 금지
+                if (cooldownCandles > 0) continue;
+
+                // 매수 조건 체크 (확장)
+                if (checkBuySignalExtended(candles, i, bp, bm, rp, rbt, vr,
+                        fbUpperMult, fbVolMult, fbRsiMin, hvThreshold, cpRate, bwMin)) {
+                    holding = true;
+                    buyPrice = currentPrice;
+                    highestPrice = currentPrice;
+                    holdingCandles = 0;
+                }
+            }
+        }
+
+        return trades;
+    }
+
+    /**
+     * 확장된 매수 신호 체크 (Fast Breakout, 추격 매수 방지 등)
+     */
+    private boolean checkBuySignalExtended(List<CandleData> candles, int idx,
+            int bp, double bm, int rp, double rbt, double vr,
+            double fbUpperMult, double fbVolMult, double fbRsiMin,
+            double hvThreshold, double cpRate, double bwMin) {
+
+        if (idx < bp + rp + 5) return false;
+
+        CandleData current = candles.get(idx);
+        double currentPrice = current.getTradePrice().doubleValue();
+        double openPrice = current.getOpeningPrice().doubleValue();
+
+        // 볼린저 밴드 계산
+        double[] bands = calculateBollingerBands(candles, idx, bp, bm);
+        double middleBand = bands[0];
+        double upperBand = bands[1];
+        double lowerBand = bands[2];
+
+        // 밴드폭 체크
+        double bandWidthPercent = ((upperBand - lowerBand) / middleBand) * 100;
+        if (bandWidthPercent < bwMin) return false;
+
+        // RSI 계산
+        double rsi = calculateRSI(candles, idx, rp);
+
+        // 거래량 체크
+        double currentVolume = current.getCandleAccTradePrice().doubleValue();
+        double avgVolume = 0;
+        for (int j = 1; j <= 5; j++) {
+            avgVolume += candles.get(idx - j).getCandleAccTradePrice().doubleValue();
+        }
+        avgVolume /= 5;
+        double volumeRatio = currentVolume / avgVolume;
+
+        // 🚀 Fast Breakout 체크
+        boolean isBullish = currentPrice > openPrice;
+        boolean isAboveUpperBand = currentPrice > upperBand * fbUpperMult;
+        boolean isHighVolume = volumeRatio >= fbVolMult;
+        boolean isRsiAboveThreshold = rsi > fbRsiMin;
+
+        if (isAboveUpperBand && isHighVolume && isRsiAboveThreshold && isBullish) {
+            return true;  // Fast Breakout 진입
+        }
+
+        // RSI 과매수 차단 (일반 진입에만)
+        if (rsi > 70) return false;
+
+        // 추격 매수 방지
+        double distanceFromLower = (currentPrice - lowerBand) / lowerBand;
+        if (distanceFromLower > cpRate) return false;
+
+        // 급등 차단 (ATR 대비 큰 캔들, 단 고거래량 예외)
+        double atr = calculateATR(candles, idx, rp);
+        double candleMove = Math.abs(currentPrice - candles.get(idx - 1).getTradePrice().doubleValue());
+        if (candleMove > atr * 0.8 && volumeRatio < hvThreshold) return false;
+
+        // 기존 진입 조건
+        double volumeRate = volumeRatio * 100;
+        boolean nearLowerBand = currentPrice <= lowerBand * 1.02;
+        boolean rsiOversold = rsi <= rbt;
+        boolean volumeIncrease = volumeRate >= vr;
+        boolean aboveMiddle = currentPrice > middleBand * 0.98;
+
+        return (nearLowerBand && rsiOversold) || (rsiOversold && volumeIncrease && aboveMiddle);
+    }
+
+    /**
+     * ATR 계산
+     */
+    private double calculateATR(List<CandleData> candles, int idx, int period) {
+        double sum = 0;
+        for (int i = 0; i < period && idx - i - 1 >= 0; i++) {
+            double h = candles.get(idx - i).getHighPrice().doubleValue();
+            double l = candles.get(idx - i).getLowPrice().doubleValue();
+            double pc = candles.get(idx - i - 1).getTradePrice().doubleValue();
+            sum += Math.max(h - l, Math.max(Math.abs(h - pc), Math.abs(l - pc)));
+        }
+        return sum / period;
+    }
+
+    /**
+     * 시뮬레이션 실행 (기본 버전 - 호환성 유지)
      */
     private SimulationResult runSimulation(Map<String, List<CandleData>> marketCandles, Map<String, Object> params) {
         int totalTrades = 0;
@@ -548,18 +988,41 @@ public class StrategyOptimizerService {
      */
     private OptimizedParams getDefaultParams() {
         return OptimizedParams.builder()
+                // 기본 볼린저밴드
                 .bollingerPeriod(20)
                 .bollingerMultiplier(2.0)
+                // RSI
                 .rsiPeriod(14)
                 .rsiBuyThreshold(30)
                 .rsiSellThreshold(70)
-                .volumeIncreaseRate(100)
-                .stopLossRate(-2.5)
-                .takeProfitRate(3.0)
-                .trailingStopRate(1.5)
-                .bandWidthMinPercent(0.8)
-                .upperWickMaxRatio(0.45)
+                // 거래량
+                .volumeIncreaseRate(120)
                 .minTradeAmount(50_000_000)
+                // 손절/익절 기본
+                .stopLossRate(-2.5)
+                .takeProfitRate(2.0)
+                .trailingStopRate(1.5)
+                // ATR 기반
+                .stopLossAtrMult(2.0)
+                .takeProfitAtrMult(2.5)
+                .trailingStopAtrMult(1.5)
+                .maxStopLossRate(0.03)
+                // 캔들 기반
+                .stopLossCooldownCandles(5)
+                .minHoldCandles(3)
+                // 슬리피지/수수료
+                .totalCost(0.002)
+                .minProfitRate(0.006)
+                // Fast Breakout
+                .fastBreakoutUpperMult(1.002)
+                .fastBreakoutVolumeMult(2.5)
+                .fastBreakoutRsiMin(55.0)
+                // 급등 차단/추격 방지
+                .highVolumeThreshold(2.0)
+                .chasePreventionRate(0.035)
+                .bandWidthMinPercent(0.8)
+                .atrCandleMoveMult(0.8)
+                // 성과 지표
                 .expectedWinRate(50)
                 .expectedProfitRate(0)
                 .totalSignals(0)
@@ -575,22 +1038,53 @@ public class StrategyOptimizerService {
         log.info("[{}] 최적화 파라미터 저장 중... (Market: {})", strategyName, market);
 
         Map<String, String> paramMap = new HashMap<>();
+
+        // 기본 볼린저밴드
         paramMap.put("bollinger.period", String.valueOf(params.getBollingerPeriod()));
         paramMap.put("bollinger.multiplier", String.valueOf(params.getBollingerMultiplier()));
+
+        // RSI
         paramMap.put("rsi.period", String.valueOf(params.getRsiPeriod()));
         paramMap.put("rsi.oversold", String.valueOf(params.getRsiBuyThreshold()));
         paramMap.put("rsi.overbought", String.valueOf(params.getRsiSellThreshold()));
+
+        // 거래량
         paramMap.put("volume.threshold", String.valueOf(params.getVolumeIncreaseRate()));
+
+        // 손절/익절 기본
         paramMap.put("stopLoss.rate", String.valueOf(params.getStopLossRate()));
         paramMap.put("takeProfit.rate", String.valueOf(params.getTakeProfitRate()));
         paramMap.put("trailingStop.rate", String.valueOf(params.getTrailingStopRate()));
 
-        // StrategyParameterService를 통해 저장 (현재는 글로벌 기반으로만 저장하는 예시)
-        // market 정보를 paramKey에 포함시키거나 별도의 구조가 필요할 수 있음
-        // 여기서는 일단 기본 키값으로 저장
+        // ATR 기반
+        paramMap.put("stopLoss.atrMult", String.valueOf(params.getStopLossAtrMult()));
+        paramMap.put("takeProfit.atrMult", String.valueOf(params.getTakeProfitAtrMult()));
+        paramMap.put("trailingStop.atrMult", String.valueOf(params.getTrailingStopAtrMult()));
+        paramMap.put("maxStopLoss.rate", String.valueOf(params.getMaxStopLossRate()));
+
+        // 캔들 기반
+        paramMap.put("stopLoss.cooldownCandles", String.valueOf(params.getStopLossCooldownCandles()));
+        paramMap.put("minHold.candles", String.valueOf(params.getMinHoldCandles()));
+
+        // 슬리피지/수수료
+        paramMap.put("total.cost", String.valueOf(params.getTotalCost()));
+        paramMap.put("minProfit.rate", String.valueOf(params.getMinProfitRate()));
+
+        // Fast Breakout
+        paramMap.put("fastBreakout.upperMult", String.valueOf(params.getFastBreakoutUpperMult()));
+        paramMap.put("fastBreakout.volumeMult", String.valueOf(params.getFastBreakoutVolumeMult()));
+        paramMap.put("fastBreakout.rsiMin", String.valueOf(params.getFastBreakoutRsiMin()));
+
+        // 급등 차단/추격 방지
+        paramMap.put("highVolume.threshold", String.valueOf(params.getHighVolumeThreshold()));
+        paramMap.put("chasePrevention.rate", String.valueOf(params.getChasePreventionRate()));
+        paramMap.put("bandWidth.minPercent", String.valueOf(params.getBandWidthMinPercent()));
+        paramMap.put("atr.candleMoveMult", String.valueOf(params.getAtrCandleMoveMult()));
+
+        // StrategyParameterService를 통해 저장
         strategyParameterService.setUserParameters(userId, strategyName, paramMap);
 
-        log.info("[{}] 최적화 파라미터 저장 완료", strategyName);
+        log.info("[{}] 최적화 파라미터 저장 완료 (총 {}개 파라미터)", strategyName, paramMap.size());
     }
 
     /**

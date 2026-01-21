@@ -244,18 +244,49 @@ public class StrategyOptimizerController {
         try {
             // StrategyOptimizerService.OptimizedParams 객체를 Map으로 변환하여 setParams 호출
             Map<String, Object> paramMap = new HashMap<>();
+
+            // 기본 볼린저밴드
             paramMap.put("bollingerPeriod", params.getBollingerPeriod());
             paramMap.put("bollingerMultiplier", params.getBollingerMultiplier());
+
+            // RSI
             paramMap.put("rsiPeriod", params.getRsiPeriod());
             paramMap.put("rsiBuyThreshold", params.getRsiBuyThreshold());
             paramMap.put("rsiSellThreshold", params.getRsiSellThreshold());
+
+            // 거래량
             paramMap.put("volumeIncreaseRate", params.getVolumeIncreaseRate());
+            paramMap.put("minTradeAmount", params.getMinTradeAmount());
+
+            // 손절/익절 기본
             paramMap.put("stopLossRate", params.getStopLossRate());
             paramMap.put("takeProfitRate", params.getTakeProfitRate());
             paramMap.put("trailingStopRate", params.getTrailingStopRate());
+
+            // ATR 기반
+            paramMap.put("stopLossAtrMult", params.getStopLossAtrMult());
+            paramMap.put("takeProfitAtrMult", params.getTakeProfitAtrMult());
+            paramMap.put("trailingStopAtrMult", params.getTrailingStopAtrMult());
+            paramMap.put("maxStopLossRate", params.getMaxStopLossRate());
+
+            // 캔들 기반
+            paramMap.put("stopLossCooldownCandles", params.getStopLossCooldownCandles());
+            paramMap.put("minHoldCandles", params.getMinHoldCandles());
+
+            // 슬리피지/수수료
+            paramMap.put("totalCost", params.getTotalCost());
+            paramMap.put("minProfitRate", params.getMinProfitRate());
+
+            // Fast Breakout
+            paramMap.put("fastBreakoutUpperMult", params.getFastBreakoutUpperMult());
+            paramMap.put("fastBreakoutVolumeMult", params.getFastBreakoutVolumeMult());
+            paramMap.put("fastBreakoutRsiMin", params.getFastBreakoutRsiMin());
+
+            // 급등 차단/추격 방지
+            paramMap.put("highVolumeThreshold", params.getHighVolumeThreshold());
+            paramMap.put("chasePreventionRate", params.getChasePreventionRate());
             paramMap.put("bandWidthMinPercent", params.getBandWidthMinPercent());
-            paramMap.put("upperWickMaxRatio", params.getUpperWickMaxRatio());
-            paramMap.put("minTradeAmount", params.getMinTradeAmount());
+            paramMap.put("atrCandleMoveMult", params.getAtrCandleMoveMult());
 
             dataDrivenStrategy.setParams(paramMap);
 
