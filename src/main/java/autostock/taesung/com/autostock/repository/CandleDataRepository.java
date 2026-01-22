@@ -1,6 +1,7 @@
 package autostock.taesung.com.autostock.repository;
 
 import autostock.taesung.com.autostock.entity.CandleData;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -79,4 +80,19 @@ public interface CandleDataRepository extends JpaRepository<CandleData, Long> {
             @Param("unit") int unit,
             @Param("startDate") String startDate,
             @Param("endDateNext") String endDateNext);
+
+    /**
+     * 특정 마켓 최근 N분 캔들 조회 (최신순)
+     */
+    @Query("""
+        SELECT c
+        FROM CandleData c
+        WHERE c.market = :market
+          AND c.unit = :unit
+        ORDER BY c.candleDateTimeKst DESC
+    """)
+    List<CandleData> findRecentMinutes(
+            @Param("market") String market,
+            @Param("unit") int unit,
+            Pageable pageable);
 }

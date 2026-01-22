@@ -205,6 +205,8 @@ public class ScaledTradingStrategy implements TradingStrategy {
                 getStrategyName(), null, "rsi.oversold", 35.0);
         double volumeThreshold = strategyParameterService.getDoubleParam(
                 getStrategyName(), null, "volume.threshold", 100.0);
+        double prevVolume = candles.get(1).getCandleAccTradePrice().doubleValue();
+        double volumeSpikeRatio = currentVolume / prevVolume;
 
         // 거래대금 필터
         double minTradeAmount = getMinTradeAmountByTime();
@@ -215,7 +217,7 @@ public class ScaledTradingStrategy implements TradingStrategy {
         // 급등 추격 차단
         double candleMove = Math.abs(candles.get(0).getTradePrice().doubleValue()
                 - candles.get(1).getTradePrice().doubleValue());
-        if (candleMove > atr * 0.6) {
+        if (candleMove > atr * 0.6 && volumeSpikeRatio < 1.8) {
             return 0;
         }
 
@@ -224,6 +226,13 @@ public class ScaledTradingStrategy implements TradingStrategy {
         boolean condition2 = isHigherLowStructure(candles) && rsi < 45 && rsi > rsiOversold;
         boolean condition3 = currentVolume > avgVolume * (volumeThreshold / 100) &&
                              currentPrice > middleBand * 0.98 && rsi < 55;
+
+        // 거래량 급증 + 가격 구조
+        boolean condition4 =
+                volumeSpikeRatio >= 2.0 &&          // 직전 대비 거래량 2배 이상
+                        currentPrice > candles.get(1).getTradePrice().doubleValue() && // 양봉
+                        rsi >= 50 && rsi <= 65 &&            // 초입 RSI
+                        currentPrice < middleBand * 1.03;   // 아직 멀리 안 감
 
         // 추가 진입 조건 (기존 포지션 확인)
         Optional<Position> existingPosition = positionRepository.findActivePosition(1L, market);
@@ -252,7 +261,7 @@ public class ScaledTradingStrategy implements TradingStrategy {
         }
 
         // 신규 진입
-        if (condition1 || condition2 || condition3) {
+        if (condition1 || condition2 || condition3 || condition4) {
             String reason = condition1 ? "볼린저하단+RSI과매도" :
                            condition2 ? "저점상승구조" : "거래량돌파";
             log.info("[{}] 📊 1차 진입 신호! 사유: {}, RSI: {}",
