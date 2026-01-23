@@ -6,22 +6,27 @@ package autostock.taesung.com.autostock.strategy.config;
  */
 public class TimeWindowConfig {
 
-    // 🔒 하드 최소 거래대금 (절대 기준)
-    private final double hardMinTradeAmount;
+    private final double minVolume;          // 🔥 최소 거래량
+    private final double volumeFactor;       // 평균 대비 배수
+    private final double tradeAmountFactor;  // 거래대금 보조
 
-    // 📊 평균 대비 배율
-    private final double liquidityFactor;
-
-    public TimeWindowConfig(double hardMinTradeAmount, double liquidityFactor) {
-        this.hardMinTradeAmount = hardMinTradeAmount;
-        this.liquidityFactor = liquidityFactor;
+    public TimeWindowConfig(double minVolume,
+                            double volumeFactor,
+                            double tradeAmountFactor) {
+        this.minVolume = minVolume;
+        this.volumeFactor = volumeFactor;
+        this.tradeAmountFactor = tradeAmountFactor;
     }
 
-    public double getHardMinTradeAmount() {
-        return hardMinTradeAmount;
+    public double getMinVolume() {
+        return minVolume;
     }
 
-    public double getLiquidityFactor() {
-        return liquidityFactor;
+    public double getVolumeFactor() {
+        return volumeFactor;
+    }
+
+    public double getTradeAmountFactor() {
+        return tradeAmountFactor;
     }
 }

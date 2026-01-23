@@ -33,13 +33,9 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
     private static final int RSI_PERIOD = 14;
 
     private static final double TRAIL_ATR_MULTIPLIER = 1.0;
-    private static final double MIN_PROFIT_ATR = 1.2;
+    private static final double MIN_PROFIT_ATR = 1.0;
 
-    /* ================= 성과 기반 자동 튜닝 ================= */
-
-    private static final int PERFORMANCE_WINDOW = 20;
-    private int winCount = 0;
-    private int lossCount = 0;
+    private static final int Z_WINDOW = 20;
 
     private final Map<String, State> states = new ConcurrentHashMap<>();
 
@@ -60,168 +56,141 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         if (market.equals("KRW-BTC") || market.equals("KRW-ETH")) return 0;
         if (candles.size() < 30) return 0;
 
+        int last = candles.size() - 1;
+
+        Candle cur = candles.get(last - 1);
+        Candle prev = candles.get(last - 2);
+
         State state = states.computeIfAbsent(market, k -> new State());
 
-        TradeHistory latest = tradeHistoryRepository.findLatestByMarket(market)
-                .stream().findFirst().orElse(null);
+        TradeHistory latest =
+                tradeHistoryRepository.findLatestByMarket(market)
+                        .stream().findFirst().orElse(null);
 
-        boolean holding = latest != null &&
-                latest.getTradeType() == TradeHistory.TradeType.BUY;
+        boolean holding =
+                latest != null && latest.getTradeType() == TradeHistory.TradeType.BUY;
 
-        double price = candles.get(0).getTradePrice().doubleValue();
+        double price = cur.getTradePrice().doubleValue();
         double atr = atr(candles);
         double rsi = rsi(candles);
+        double zScore = volumeZScore(candles, Z_WINDOW);
 
         if (holding) {
-            return exit(market, latest, price, atr, rsi, state);
+            return exit(market, latest, price, atr, rsi, zScore, state);
         }
-        return entry(market, candles, price, atr, rsi, state);
+
+        return entry(market, candles, cur, prev, price, atr, rsi, zScore, state);
     }
 
     /* ================= 진입 ================= */
 
     private int entry(String market, List<Candle> candles,
-                      double price, double atr, double rsi, State state) {
+                      Candle cur, Candle prev,
+                      double price, double atr, double rsi,
+                      double zScore, State state) {
 
-        Candle cur = candles.get(0);
-        Candle prev = candles.get(1);
-
-        double curTradeAmount = cur.getCandleAccTradePrice().doubleValue();
-
-        /* === 시장 평균 거래대금 === */
-        double avgKrwAltTradeAmount30m =
-                marketVolumeService.getKrwAltAvgTradeAmount(30);
-
-        /* === 시간대 설정 === */
+        int last = candles.size() - 1;
         TimeWindowConfig cfg = getTimeWindowConfig();
 
-        double dynamicMin =
-                avgKrwAltTradeAmount30m * cfg.getLiquidityFactor();
+        double curVolume = cur.getCandleAccTradeVolume().doubleValue();
+        double avgVolume5 =
+                candles.subList(last - 6, last - 1).stream()
+                        .mapToDouble(c -> c.getCandleAccTradeVolume().doubleValue())
+                        .average().orElse(0);
 
-        /* === 성과 기반 자동 보정 === */
-        double performanceFactor = getPerformanceFactor();
+        boolean volumeOk =
+                curVolume >= Math.max(cfg.getMinVolume(), avgVolume5 * cfg.getVolumeFactor());
 
-        double minTradeAmount =
-                Math.max(
-                        cfg.getHardMinTradeAmount(),
-                        dynamicMin * performanceFactor
-                );
+        boolean earlyBreakout =
+                zScore >= 1.6 &&
+                        (price - prev.getTradePrice().doubleValue())
+                                / prev.getTradePrice().doubleValue() >= 0.0018 &&
+                        rsi >= 35 && rsi <= 60;
 
-        if (curTradeAmount < minTradeAmount) {
-            return 0;
-        }
+        boolean strongBreakout =
+                zScore >= 2.0 &&
+                        price > prev.getHighPrice().doubleValue() &&
+                        rsi <= 78;
 
-        /* === 거래량 스파이크 === */
-        double avgVol5 = candles.subList(1, 6).stream()
-                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
-                .average().orElse(1);
+        boolean entrySignal = earlyBreakout || (strongBreakout && volumeOk);
 
-        boolean strongVolume =
-                curTradeAmount >= avgVol5 * 3.0 &&
-                        curTradeAmount >= prev.getCandleAccTradePrice().doubleValue() * 2.5;
+        log.debug(
+                "[{}] ENTRY chk | Z={} vol={} avg5={} rsi={}",
+                market,
+                String.format("%.2f", zScore),
+                (long) curVolume,
+                (long) avgVolume5,
+                String.format("%.1f", rsi)
+        );
 
-        /* === 구조 돌파 === */
-        boolean breakout =
-                price > prev.getHighPrice().doubleValue() &&
-                        price > cur.getOpeningPrice().doubleValue();
+        if (!entrySignal) return 0;
 
-        boolean rsiEarly = rsi >= 50 && rsi <= 68;
-        boolean notFakeVolume = !isFakeVolume(candles);
+        state.entryPrice = price;
+        state.highest = price;
+        state.stop = Math.min(
+                prev.getLowPrice().doubleValue(),
+                price - atr * 0.7
+        );
+        state.entryZ = zScore;
 
-        if (strongVolume && breakout && rsiEarly && notFakeVolume) {
+        log.info("[{}] 🚀 ENTRY | Z={} rsi={}",
+                market,
+                String.format("%.2f", zScore),
+                String.format("%.1f", rsi)
+        );
 
-            state.entryPrice = price;
-            state.highest = price;
-            state.stop = Math.min(
-                    prev.getLowPrice().doubleValue(),
-                    price - atr * 0.8
-            );
-            state.entryTime = LocalDateTime.now();
-
-            log.info("[{}] 🚀 VOLUME BREAKOUT | 거래대금:{} / 기준:{} / 보정:{}",
-                    market,
-                    String.format("%.0f", curTradeAmount),
-                    String.format("%.0f", minTradeAmount),
-                    String.format("%.2f", performanceFactor));
-
-            return 1;
-        }
-
-        return 0;
+        return 1;
     }
 
-    /* ================= 청산 ================= */
+    /* ================= 청산 (Z-score 핵심) ================= */
 
     private int exit(String market, TradeHistory trade,
-                     double price, double atr, double rsi, State state) {
+                     double price, double atr, double rsi,
+                     double zScore, State state) {
 
         state.highest = Math.max(state.highest, price);
 
         long minutes =
                 Duration.between(trade.getCreatedAt(), LocalDateTime.now()).toMinutes();
 
+        /* 🔴 손절 */
         if (price <= state.stop && minutes >= 1) {
-            recordLoss();
-            log.warn("[{}] 🔴 구조 손절", market);
+            log.warn("[{}] 🔴 STOP LOSS", market);
             return -1;
         }
 
         double profitAtr = (price - state.entryPrice) / atr;
 
-        if (profitAtr >= MIN_PROFIT_ATR) {
+        if (profitAtr < MIN_PROFIT_ATR) return 0;
 
-            double trail = state.highest - atr * TRAIL_ATR_MULTIPLIER;
+        /* 🟡 Z-score 약화 → 익절 준비 */
+        if (zScore < 1.0 && rsi < 65 && minutes >= 2) {
+            log.info("[{}] 🟡 Z WEAK EXIT | Z={}", market, String.format("%.2f", zScore));
+            return -1;
+        }
 
-            if (rsi >= 75) {
-                trail = state.highest - atr * 0.7;
-            }
+        /* 🟢 Z 급락 → 즉시 익절 */
+        if (zScore < 0.3 && minutes >= 1) {
+            log.info("[{}] 🟢 Z DROP EXIT | Z={}", market, String.format("%.2f", zScore));
+            return -1;
+        }
 
-            if (price <= trail && minutes >= 2) {
-                recordWin();
-                log.info("[{}] 🟢 런 트레일링 익절", market);
-                return -1;
-            }
+        /* 🔵 ATR 트레일링 (보조) */
+        double trail = state.highest - atr * TRAIL_ATR_MULTIPLIER;
+        if (price <= trail && minutes >= 3) {
+            log.info("[{}] 🔵 TRAIL EXIT", market);
+            return -1;
         }
 
         return 0;
-    }
-
-    /* ================= 성과 학습 ================= */
-
-    private void recordWin() {
-        winCount++;
-        trimPerformance();
-    }
-
-    private void recordLoss() {
-        lossCount++;
-        trimPerformance();
-    }
-
-    private void trimPerformance() {
-        if (winCount + lossCount > PERFORMANCE_WINDOW) {
-            if (lossCount > winCount) lossCount--;
-            else winCount--;
-        }
-    }
-
-    private double getPerformanceFactor() {
-        int total = winCount + lossCount;
-        if (total < 5) return 1.0;
-
-        double winRate = (double) winCount / total;
-
-        if (winRate < 0.35) return 1.25;
-        if (winRate > 0.60) return 0.85;
-
-        return 1.0;
     }
 
     /* ================= 보조 ================= */
 
     private double atr(List<Candle> c) {
         double sum = 0;
-        for (int i = 0; i < ATR_PERIOD; i++) {
+        int last = c.size() - 1;
+        for (int i = last - 2; i >= last - ATR_PERIOD - 1; i--) {
             double h = c.get(i).getHighPrice().doubleValue();
             double l = c.get(i).getLowPrice().doubleValue();
             double pc = c.get(i + 1).getTradePrice().doubleValue();
@@ -232,7 +201,8 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
 
     private double rsi(List<Candle> c) {
         double g = 0, l = 0;
-        for (int i = 0; i < RSI_PERIOD; i++) {
+        int last = c.size() - 1;
+        for (int i = last - 2; i >= last - RSI_PERIOD - 1; i--) {
             double d = c.get(i).getTradePrice().doubleValue()
                     - c.get(i + 1).getTradePrice().doubleValue();
             if (d > 0) g += d;
@@ -241,33 +211,44 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         return l == 0 ? 100 : 100 - (100 / (1 + g / l));
     }
 
-    private boolean isFakeVolume(List<Candle> candles) {
-        Candle c = candles.get(0);
-        double body =
-                Math.abs(c.getTradePrice().doubleValue() - c.getOpeningPrice().doubleValue());
-        double range =
-                c.getHighPrice().doubleValue() - c.getLowPrice().doubleValue();
+    private double volumeZScore(List<Candle> candles, int window) {
+        int size = candles.size();
+        if (size < window + 1) return 0;
 
-        return range > 0 &&
-                body / range < 0.3 &&
-                c.getTradePrice().doubleValue() < c.getHighPrice().doubleValue() * 0.97;
+        int last = size - 1;
+        double mean =
+                candles.subList(last - window, last).stream()
+                        .mapToDouble(c -> c.getCandleAccTradeVolume().doubleValue())
+                        .average().orElse(0);
+
+        double variance =
+                candles.subList(last - window, last).stream()
+                        .mapToDouble(c -> Math.pow(
+                                c.getCandleAccTradeVolume().doubleValue() - mean, 2))
+                        .average().orElse(0);
+
+        double std = Math.sqrt(variance);
+        if (std == 0) return 0;
+
+        double curVolume =
+                candles.get(last).getCandleAccTradeVolume().doubleValue();
+
+        return (curVolume - mean) / std;
     }
 
     private TimeWindowConfig getTimeWindowConfig() {
         int hour = LocalTime.now(ZoneId.of("Asia/Seoul")).getHour();
-
-        if (hour >= 2 && hour < 8) return new TimeWindowConfig(3_000_000_000.0, 0.6);
-        if (hour >= 9 && hour < 12) return new TimeWindowConfig(2_500_000_000.0, 0.5);
-        if (hour >= 12 && hour < 18) return new TimeWindowConfig(2_000_000_000.0, 0.45);
-        if (hour >= 18 && hour < 22) return new TimeWindowConfig(2_500_000_000.0, 0.5);
-
-        return new TimeWindowConfig(3_500_000_000.0, 0.6);
+        if (hour >= 2 && hour < 8) return new TimeWindowConfig(8_000, 1.1, 0.6);
+        if (hour >= 9 && hour < 12) return new TimeWindowConfig(15_000, 1.2, 0.7);
+        if (hour >= 12 && hour < 18) return new TimeWindowConfig(20_000, 1.3, 0.8);
+        if (hour >= 18 && hour < 22) return new TimeWindowConfig(25_000, 1.35, 0.9);
+        return new TimeWindowConfig(12_000, 1.15, 0.7);
     }
 
     private static class State {
         double entryPrice;
         double highest;
         double stop;
-        LocalDateTime entryTime;
+        double entryZ;
     }
 }
