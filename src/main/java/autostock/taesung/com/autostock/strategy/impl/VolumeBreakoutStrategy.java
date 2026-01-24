@@ -36,6 +36,11 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
     private static final double MIN_PROFIT_ATR = 1.0;
 
     private static final int Z_WINDOW = 20;
+    private static final int VOLUME_LOOKBACK = 30;
+
+    // 🔒 거래량 안전장치
+    private static final double ABS_MIN_AVG_VOLUME = 5_000;   // 완전 유령 코인 차단
+    private static final double DZ_THRESHOLD = 0.35;          // Z-score 상승 속도
 
     private final Map<String, State> states = new ConcurrentHashMap<>();
 
@@ -54,7 +59,7 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
 
         if (!market.startsWith("KRW-")) return 0;
         if (market.equals("KRW-BTC") || market.equals("KRW-ETH")) return 0;
-        if (candles.size() < 30) return 0;
+        if (candles.size() < 40) return 0;
 
         int last = candles.size() - 1;
 
@@ -73,13 +78,16 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         double price = cur.getTradePrice().doubleValue();
         double atr = atr(candles);
         double rsi = rsi(candles);
+
         double zScore = volumeZScore(candles, Z_WINDOW);
+        double prevZ = volumeZScore(candles.subList(0, candles.size() - 1), Z_WINDOW);
+        double dz = zScore - prevZ;
 
         if (holding) {
             return exit(market, latest, price, atr, rsi, zScore, state);
         }
 
-        return entry(market, candles, cur, prev, price, atr, rsi, zScore, state);
+        return entry(market, candles, cur, prev, price, atr, rsi, zScore, dz, state);
     }
 
     /* ================= 진입 ================= */
@@ -87,39 +95,49 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
     private int entry(String market, List<Candle> candles,
                       Candle cur, Candle prev,
                       double price, double atr, double rsi,
-                      double zScore, State state) {
+                      double zScore, double dz,
+                      State state) {
 
         int last = candles.size() - 1;
         TimeWindowConfig cfg = getTimeWindowConfig();
 
         double curVolume = cur.getCandleAccTradeVolume().doubleValue();
-        double avgVolume5 =
-                candles.subList(last - 6, last - 1).stream()
+
+        double avgVolume30 =
+                candles.subList(last - VOLUME_LOOKBACK, last).stream()
                         .mapToDouble(c -> c.getCandleAccTradeVolume().doubleValue())
                         .average().orElse(0);
 
-        boolean volumeOk =
-                curVolume >= Math.max(cfg.getMinVolume(), avgVolume5 * cfg.getVolumeFactor());
+        // ❌ 거래량 거의 없는 코인 제거
+        if (avgVolume30 < ABS_MIN_AVG_VOLUME) return 0;
+        if (curVolume < avgVolume30 * 0.8) return 0;
+
+        // ❌ Z-score 증가 중이 아니면 진입 금지
+        if (dz < DZ_THRESHOLD) return 0;
+
+        double priceChange =
+                (price - prev.getTradePrice().doubleValue())
+                        / prev.getTradePrice().doubleValue();
 
         boolean earlyBreakout =
                 zScore >= 1.6 &&
-                        (price - prev.getTradePrice().doubleValue())
-                                / prev.getTradePrice().doubleValue() >= 0.0018 &&
+                        priceChange >= 0.0015 &&
                         rsi >= 35 && rsi <= 60;
 
         boolean strongBreakout =
-                zScore >= 2.0 &&
+                zScore >= 2.1 &&
                         price > prev.getHighPrice().doubleValue() &&
                         rsi <= 78;
 
-        boolean entrySignal = earlyBreakout || (strongBreakout && volumeOk);
+        boolean entrySignal = earlyBreakout || strongBreakout;
 
         log.debug(
-                "[{}] ENTRY chk | Z={} vol={} avg5={} rsi={}",
+                "[{}] ENTRY chk | Z={} dZ={} vol={} avg30={} rsi={}",
                 market,
                 String.format("%.2f", zScore),
+                String.format("%.2f", dz),
                 (long) curVolume,
-                (long) avgVolume5,
+                (long) avgVolume30,
                 String.format("%.1f", rsi)
         );
 
@@ -133,16 +151,17 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         );
         state.entryZ = zScore;
 
-        log.info("[{}] 🚀 ENTRY | Z={} rsi={}",
+        log.info("[{}] 🚀 ENTRY | Z={} dZ={} rsi={}",
                 market,
                 String.format("%.2f", zScore),
+                String.format("%.2f", dz),
                 String.format("%.1f", rsi)
         );
 
         return 1;
     }
 
-    /* ================= 청산 (Z-score 핵심) ================= */
+    /* ================= 청산 ================= */
 
     private int exit(String market, TradeHistory trade,
                      double price, double atr, double rsi,
@@ -153,29 +172,24 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         long minutes =
                 Duration.between(trade.getCreatedAt(), LocalDateTime.now()).toMinutes();
 
-        /* 🔴 손절 */
         if (price <= state.stop && minutes >= 1) {
             log.warn("[{}] 🔴 STOP LOSS", market);
             return -1;
         }
 
         double profitAtr = (price - state.entryPrice) / atr;
-
         if (profitAtr < MIN_PROFIT_ATR) return 0;
 
-        /* 🟡 Z-score 약화 → 익절 준비 */
         if (zScore < 1.0 && rsi < 65 && minutes >= 2) {
-            log.info("[{}] 🟡 Z WEAK EXIT | Z={}", market, String.format("%.2f", zScore));
+            log.info("[{}] 🟡 Z WEAK EXIT", market);
             return -1;
         }
 
-        /* 🟢 Z 급락 → 즉시 익절 */
         if (zScore < 0.3 && minutes >= 1) {
-            log.info("[{}] 🟢 Z DROP EXIT | Z={}", market, String.format("%.2f", zScore));
+            log.info("[{}] 🟢 Z DROP EXIT", market);
             return -1;
         }
 
-        /* 🔵 ATR 트레일링 (보조) */
         double trail = state.highest - atr * TRAIL_ATR_MULTIPLIER;
         if (price <= trail && minutes >= 3) {
             log.info("[{}] 🔵 TRAIL EXIT", market);
@@ -185,7 +199,7 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         return 0;
     }
 
-    /* ================= 보조 ================= */
+    /* ================= 지표 ================= */
 
     private double atr(List<Candle> c) {
         double sum = 0;
@@ -212,10 +226,10 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
     }
 
     private double volumeZScore(List<Candle> candles, int window) {
-        int size = candles.size();
-        if (size < window + 1) return 0;
+        if (candles.size() < window + 1) return 0;
 
-        int last = size - 1;
+        int last = candles.size() - 1;
+
         double mean =
                 candles.subList(last - window, last).stream()
                         .mapToDouble(c -> c.getCandleAccTradeVolume().doubleValue())
