@@ -1,6 +1,8 @@
 package autostock.taesung.com.autostock.service.impl;
 
 import autostock.taesung.com.autostock.entity.CandleData;
+import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
+import autostock.taesung.com.autostock.exchange.upbit.dto.Trade;
 import autostock.taesung.com.autostock.repository.CandleDataRepository;
 import autostock.taesung.com.autostock.service.MarketVolumeService;
 import lombok.RequiredArgsConstructor;
@@ -19,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class MarketVolumeServiceImpl implements MarketVolumeService {
 
     private final CandleDataRepository candleDataRepository;
+    private final UpbitApiService upbitApiService;
 
     private static final int UNIT_1M = 1;
     private static final Set<String> EXCLUDED =
@@ -83,5 +86,43 @@ public class MarketVolumeServiceImpl implements MarketVolumeService {
         }
 
         return count == 0 ? 0 : sum / count;
+    }
+
+    @Override
+    public double getExecutionStrength(String market, int seconds) {
+        try {
+            List<Trade> trades = upbitApiService.getTrades(market, 500);
+            if (trades == null || trades.isEmpty()) {
+                return 50.0;
+            }
+
+            long now = System.currentTimeMillis();
+            long cutoff = now - (seconds * 1000L);
+
+            double bidVolume = 0;
+            double askVolume = 0;
+
+            for (Trade trade : trades) {
+                if (trade.getTimestamp() < cutoff) {
+                    break;
+                }
+                double vol = trade.getTradeVolume().doubleValue();
+                if (trade.isBid()) {
+                    bidVolume += vol;
+                } else {
+                    askVolume += vol;
+                }
+            }
+
+            double total = bidVolume + askVolume;
+            if (total == 0) {
+                return 50.0;
+            }
+
+            return (bidVolume / total) * 100;
+        } catch (Exception e) {
+            log.warn("[{}] 체결강도 조회 실패: {}", market, e.getMessage());
+            return 50.0;
+        }
     }
 }

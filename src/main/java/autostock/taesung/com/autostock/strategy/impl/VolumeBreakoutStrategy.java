@@ -4,6 +4,7 @@ import autostock.taesung.com.autostock.entity.TradeHistory;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.realtrading.config.RealTradingConfig;
 import autostock.taesung.com.autostock.repository.TradeHistoryRepository;
+import autostock.taesung.com.autostock.service.ImpulseStatService;
 import autostock.taesung.com.autostock.service.MarketVolumeService;
 import autostock.taesung.com.autostock.service.StrategyParameterService;
 import autostock.taesung.com.autostock.strategy.TechnicalIndicator;
@@ -18,6 +19,32 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Volume Breakout 전략 (거래량 돌파 기반)
+ *
+ * [전략 목표]
+ * - 거래량 급증과 함께 가격 돌파 시 진입
+ * - Z-score 기반 거래량 이상치 탐지
+ * - ATR 기반 동적 손절/익절
+ *
+ * [핵심 변경: Impulse 연계 필터]
+ * - 단독 Breakout 진입 금지
+ * - 반드시 최근 15분 이내 Impulse 성공 이력이 있어야 진입 허용
+ * - impulseStatService.hasRecentSuccess() 체크 필수
+ *
+ * [진입 조건]
+ * 1. Impulse 연계: 15분 이내 Impulse 성공 이력 필수 (최우선)
+ * 2. 거래량 필터: 평균 거래량 5,000 이상 + 현재 >= 평균 × 0.8
+ * 3. Z-score 증가: dZ >= 0.35 (모멘텀 상승 중)
+ * 4. Early Breakout: Z >= 1.6, 가격변화 >= 0.15%, RSI 35~60
+ * 5. Strong Breakout: Z >= 2.1, 고점 돌파, RSI <= 78
+ *
+ * [청산 조건]
+ * - STOP_LOSS: 손절가 도달
+ * - Z_WEAK_EXIT: Z < 1.0 && RSI < 65 (2분 이상 보유)
+ * - Z_DROP_EXIT: Z < 0.3 (1분 이상 보유)
+ * - TRAIL_EXIT: 트레일링 스탑 (3분 이상 보유)
+ */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -29,19 +56,28 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
     private final RealTradingConfig config;
     private final MarketVolumeService marketVolumeService;
 
+    /** Impulse 연계를 위한 서비스 (성공 캐시 조회) */
+    private final ImpulseStatService impulseStatService;
+
+    // ============ 지표 파라미터 ============
     private static final int ATR_PERIOD = 14;
     private static final int RSI_PERIOD = 14;
 
+    // ============ 청산 파라미터 ============
     private static final double TRAIL_ATR_MULTIPLIER = 1.0;
     private static final double MIN_PROFIT_ATR = 1.0;
 
+    // ============ 거래량 파라미터 ============
     private static final int Z_WINDOW = 20;
     private static final int VOLUME_LOOKBACK = 30;
 
-    // 🔒 거래량 안전장치
-    private static final double ABS_MIN_AVG_VOLUME = 5_000;   // 완전 유령 코인 차단
-    private static final double DZ_THRESHOLD = 0.35;          // Z-score 상승 속도
+    /** 최소 평균 거래량 (유령 코인 필터) */
+    private static final double ABS_MIN_AVG_VOLUME = 5_000;
 
+    /** Z-score 증가 임계값 */
+    private static final double DZ_THRESHOLD = 0.35;
+
+    /** 마켓별 상태 관리 */
     private final Map<String, State> states = new ConcurrentHashMap<>();
 
     @Override
@@ -90,13 +126,33 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         return entry(market, candles, cur, prev, price, atr, rsi, zScore, dz, state);
     }
 
-    /* ================= 진입 ================= */
-
+    /**
+     * 진입 신호 평가
+     *
+     * [Impulse 연계 필터 - 최우선 조건]
+     * - 최근 15분 이내 VolumeImpulseStrategy 성공 이력 필수
+     * - 성공 이력 없으면 나머지 조건 체크 없이 즉시 return 0
+     * - 이 필터로 단독 Breakout 진입을 원천 차단
+     *
+     * [설계 의도]
+     * - Impulse 성공 = 해당 코인에 실제 매수세 유입 확인
+     * - Breakout은 Impulse 성공 이후 추가 상승 모멘텀 포착
+     * - 가짜 거래량으로 인한 손실 최소화
+     *
+     * @return 1: 매수 신호, 0: 대기
+     */
     private int entry(String market, List<Candle> candles,
                       Candle cur, Candle prev,
                       double price, double atr, double rsi,
                       double zScore, double dz,
                       State state) {
+
+        // ============ 최우선: Impulse 연계 필터 ============
+        // 최근 15분 이내 Impulse 성공 이력이 없으면 진입 차단
+        // 단독 Breakout 진입은 금지됨
+        if (!impulseStatService.hasRecentSuccess(market)) {
+            return 0;
+        }
 
         int last = candles.size() - 1;
         TimeWindowConfig cfg = getTimeWindowConfig();
@@ -151,7 +207,7 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
         );
         state.entryZ = zScore;
 
-        log.info("[{}] 🚀 ENTRY | Z={} dZ={} rsi={}",
+        log.info("[{}] BREAKOUT_ENTRY (impulse-linked) | Z={} dZ={} rsi={}",
                 market,
                 String.format("%.2f", zScore),
                 String.format("%.2f", dz),
@@ -163,6 +219,28 @@ public class VolumeBreakoutStrategy implements TradingStrategy {
 
     /* ================= 청산 ================= */
 
+    /**
+     * 청산 신호 평가
+     *
+     * [청산 조건 우선순위]
+     * 1. STOP_LOSS: 손절가 도달 (1분 이상 보유 시)
+     * 2. Z_WEAK_EXIT: Z < 1.0 && RSI < 65 (2분 이상 보유)
+     * 3. Z_DROP_EXIT: Z < 0.3 (1분 이상 보유)
+     * 4. TRAIL_EXIT: 트레일링 스탑 (3분 이상 보유)
+     *
+     * [최소 수익 조건]
+     * - profitAtr >= MIN_PROFIT_ATR (1.0) 이상이어야 청산 가능
+     * - 손절 제외, 나머지 청산 조건은 최소 수익 달성 후 적용
+     *
+     * @param market 마켓 코드
+     * @param trade 현재 포지션 거래 정보
+     * @param price 현재 가격
+     * @param atr 평균 진폭 (Average True Range)
+     * @param rsi 상대강도지수
+     * @param zScore 현재 거래량 Z-score
+     * @param state 마켓별 상태 객체
+     * @return -1: 매도 신호, 0: 대기
+     */
     private int exit(String market, TradeHistory trade,
                      double price, double atr, double rsi,
                      double zScore, State state) {

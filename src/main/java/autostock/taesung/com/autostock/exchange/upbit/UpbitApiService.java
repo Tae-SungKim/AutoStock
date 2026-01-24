@@ -381,4 +381,21 @@ public class UpbitApiService {
         List<Orderbook> orderbooks = response.getBody();
         return (orderbooks != null && !orderbooks.isEmpty()) ? orderbooks.get(0) : null;
     }
+
+    /**
+     * 최근 체결 내역 조회 (Public API - 인증 불필요)
+     * @param market 마켓 코드 (예: KRW-BTC)
+     * @param count 조회 개수 (최대 500)
+     * @return 체결 내역 리스트
+     */
+    public List<Trade> getTrades(String market, int count) {
+        String url = String.format("%s/trades/ticks?market=%s&count=%d", API_URL, market, Math.min(count, 500));
+        ResponseEntity<List<Trade>> response = restTemplate.exchange(
+                url,
+                HttpMethod.GET,
+                null,
+                new ParameterizedTypeReference<List<Trade>>() {}
+        );
+        return response.getBody();
+    }
 }
