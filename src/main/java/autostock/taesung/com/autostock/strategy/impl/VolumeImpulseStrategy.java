@@ -14,7 +14,9 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -551,44 +553,45 @@ public class VolumeImpulseStrategy implements TradingStrategy {
         if (candles.size() < 2) return 0;
 
         int last = candles.size() - 1;
-        int start = Math.max(0, last - window);
+        LocalDateTime endTime = getCandleTime(candles.get(last));
+        LocalDateTime startTime = endTime.minusMinutes(window);
 
-        // 시간 정규화 평균 (window로 나눔)
-        double sum = 0;
-        for (int i = start; i < last; i++) {
-            if (i >= 0 && i < candles.size()) {
-                sum += candles.get(i).getCandleAccTradeVolume().doubleValue();
-            }
+        // 1️⃣ 시간 슬롯 초기화 (모든 분 = 0)
+        Map<LocalDateTime, Double> volumeByMinute = new HashMap<>();
+        for (int i = 0; i < window; i++) {
+            volumeByMinute.put(startTime.plusMinutes(i), 0.0);
         }
-        double mean = sum / window;  // ★ 캔들 개수 아닌 window로 나눔 ★
 
-        // 시간 정규화 분산
-        // 실제 캔들의 편차 제곱 합 + 없는 캔들은 (0 - mean)^2로 간주
-        double sumSquaredDiff = 0;
-        int actualCandleCount = 0;
-
-        for (int i = start; i < last; i++) {
-            if (i >= 0 && i < candles.size()) {
-                double vol = candles.get(i).getCandleAccTradeVolume().doubleValue();
-                sumSquaredDiff += Math.pow(vol - mean, 2);
-                actualCandleCount++;
+        // 2️⃣ 실제 캔들 덮어쓰기
+        for (int i = 0; i < last; i++) {
+            LocalDateTime t = getCandleTime(candles.get(i))
+                    .withSecond(0).withNano(0);
+            if (!t.isBefore(startTime) && t.isBefore(endTime)) {
+                volumeByMinute.put(
+                        t,
+                        candles.get(i).getCandleAccTradeVolume().doubleValue()
+                );
             }
         }
 
-        // 없는 캔들들의 편차 (volume=0으로 간주)
-        int missingCandles = window - actualCandleCount;
-        sumSquaredDiff += missingCandles * Math.pow(0 - mean, 2);
+        // 3️⃣ 평균
+        double sum = volumeByMinute.values().stream().mapToDouble(Double::doubleValue).sum();
+        double mean = sum / window;
 
-        double variance = sumSquaredDiff / window;  // ★ window로 나눔 ★
+        // 4️⃣ 분산
+        double variance = volumeByMinute.values().stream()
+                .mapToDouble(v -> Math.pow(v - mean, 2))
+                .sum() / window;
+
         double std = Math.sqrt(variance);
-
         if (std == 0) return 0;
 
-        // 현재 거래량
+        // 5️⃣ 현재 거래량
         double curVolume = candles.get(last).getCandleAccTradeVolume().doubleValue();
 
         return (curVolume - mean) / std;
     }
+
     private LocalDateTime getCandleTime(Candle c) {
         Object t = c.getCandleDateTimeKst();
 
