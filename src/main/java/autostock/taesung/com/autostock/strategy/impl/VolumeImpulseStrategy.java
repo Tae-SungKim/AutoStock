@@ -72,9 +72,9 @@ public class VolumeImpulseStrategy implements TradingStrategy {
     private static final double MIN_CANDLE_DENSITY = 0.6;
     private static final double MIN_CANDLE_RATIO = 0.75;
 
-    private static final int MIN_1M_VOLUME = 50_000;
-    private static final int MIN_SUM_VOLUME_20M = 300_000;
-    private static final int MIN_AVG_VOLUME_20M = 10_000;
+    private static final int MIN_1M_VOLUME = 15_000;
+    private static final int MIN_SUM_VOLUME_20M = 150_000;
+    private static final int MIN_AVG_VOLUME_20M = 5_000;
 
     private static final double MAX_PRICE_RISE_5M = 0.02;
 
@@ -124,17 +124,17 @@ public class VolumeImpulseStrategy implements TradingStrategy {
         int last = candles.size() - 1;
 
         // 0️⃣ 캔들 밀도
-        double density = calculateCandleDensity(candles, last, Z_WINDOW);
+        double density = calculateCandleDensity(candles, Z_WINDOW);
         if (density < MIN_CANDLE_DENSITY) return 0;
 
         if (!isCandleCountValid(candles, last, Z_WINDOW)) return 0;
 
         ImpulseHourParam hourParam = statService.getHourParam(statService.getCurrentHour());
 
-        double curVolume = cur.getCandleAccTradeVolume().doubleValue();
+        double curVolume = getMinuteVolume(candles, candles.size() - 1);
         if (curVolume < MIN_1M_VOLUME) return 0;
 
-        double sumVolume = calculateSumVolume(candles, last - 1, Z_WINDOW);
+        double sumVolume = calculateSumVolumeNow(candles, Z_WINDOW);
         if (sumVolume < MIN_SUM_VOLUME_20M) return 0;
 
         double avgVolume = sumVolume / Z_WINDOW;
@@ -149,11 +149,11 @@ public class VolumeImpulseStrategy implements TradingStrategy {
         if (execStrength < hourParam.getMinExecutionStrengthValue()) return 0;
 
         // ⭐ Z-score 핵심 수정 ⭐
-        double z = calculateTimeNormalizedZScore(candles.subList(0, last), Z_WINDOW);
-        double prevZ = calculateTimeNormalizedZScore(candles.subList(0, last - 1), Z_WINDOW);
+        double z = calculateTimeNormalizedZScore(candles, Z_WINDOW);
+        double prevZ = calculateTimeNormalizedZScore(candles.subList(0, candles.size() - 1), Z_WINDOW);
 
-        if (z <= prevZ) return 0;
-        if (z < hourParam.getMinZScoreValue()) return 0;
+        //if (z <= prevZ) return 0;
+        //if (z < hourParam.getMinZScoreValue()) return 0;
 
         positionService.openPosition(
                 market,
@@ -224,52 +224,54 @@ public class VolumeImpulseStrategy implements TradingStrategy {
     // UTIL
     // =========================
     private double calculateSumVolume(List<Candle> candles, int last, int window) {
-        int start = Math.max(0, last - window + 1);
+        int start = Math.max(1, last - window + 1);
         double sum = 0;
         for (int i = start; i <= last; i++) {
-            sum += candles.get(i).getCandleAccTradeVolume().doubleValue();
+            sum += getMinuteVolume(candles, i);
         }
         return sum;
     }
 
     private double calculateTimeNormalizedZScore(List<Candle> candles, int window) {
-        if (candles.size() < window + 1) return 0;
+        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
+        LocalDateTime start = now.minusMinutes(window);
 
-        int last = candles.size() - 1;
-        LocalDateTime end = getCandleTime(candles.get(last)).withSecond(0).withNano(0);
-        LocalDateTime start = end.minusMinutes(window);
+        Map<LocalDateTime, Double> volumeMap =
+                buildMinuteVolumeMapNowBase(candles, start, now, window);
 
-        Map<LocalDateTime, Double> slots = new HashMap<>();
-        for (int i = 0; i < window; i++) {
-            slots.put(start.plusMinutes(i), 0.0);
-        }
+        double mean = volumeMap.values().stream()
+                .mapToDouble(v -> v)
+                .average()
+                .orElse(0);
 
-        for (int i = 0; i < last; i++) {
-            LocalDateTime t = getCandleTime(candles.get(i)).withSecond(0).withNano(0);
-            if (!t.isBefore(start) && t.isBefore(end)) {
-                slots.put(t, candles.get(i).getCandleAccTradeVolume().doubleValue());
-            }
-        }
+        double variance = volumeMap.values().stream()
+                .mapToDouble(v -> Math.pow(v - mean, 2))
+                .average()
+                .orElse(0);
 
-        double mean = slots.values().stream().mapToDouble(v -> v).sum() / window;
-        double var = slots.values().stream().mapToDouble(v -> Math.pow(v - mean, 2)).sum() / window;
-        double std = Math.sqrt(var);
+        double std = Math.sqrt(variance);
         if (std == 0) return 0;
 
-        double curVol = candles.get(last).getCandleAccTradeVolume().doubleValue();
+        // 현재 분 거래량 (now-1분 기준)
+        double curVol = volumeMap.getOrDefault(
+                now.minusMinutes(1), 0.0
+        );
+
         return (curVol - mean) / std;
     }
 
-    private double calculateCandleDensity(List<Candle> candles, int last, int window) {
-        LocalDateTime end = getCandleTime(candles.get(last)).withSecond(0).withNano(0);
-        LocalDateTime start = end.minusMinutes(window);
+    private double calculateCandleDensity(List<Candle> candles, int window) {
+        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
+        LocalDateTime start = now.minusMinutes(window);
 
-        return candles.stream()
+        long count = candles.stream()
                 .map(this::getCandleTime)
-                .filter(t -> !t.isBefore(start) && t.isBefore(end))
                 .map(t -> t.withSecond(0).withNano(0))
+                .filter(t -> !t.isBefore(start) && t.isBefore(now))
                 .distinct()
-                .count() / (double) window;
+                .count();
+
+        return count / (double) window;
     }
 
     private boolean isCandleCountValid(List<Candle> candles, int last, int window) {
@@ -282,6 +284,56 @@ public class VolumeImpulseStrategy implements TradingStrategy {
                 .count();
 
         return count >= window * MIN_CANDLE_RATIO;
+    }
+
+    private double getMinuteVolume(List<Candle> candles, int idx) {
+        if (idx == 0) return 0;
+        double cur = candles.get(idx).getCandleAccTradeVolume().doubleValue();
+        double prev = candles.get(idx - 1).getCandleAccTradeVolume().doubleValue();
+        return Math.max(0, cur - prev);
+    }
+
+    private Map<LocalDateTime, Double> buildMinuteVolumeMapNowBase(
+            List<Candle> candles,
+            LocalDateTime start,
+            LocalDateTime end,
+            int window
+    ) {
+        Map<LocalDateTime, Double> map = new HashMap<>();
+
+        // 1️⃣ 모든 분 슬롯 0으로 초기화
+        for (int i = 0; i < window; i++) {
+            map.put(start.plusMinutes(i), 0.0);
+        }
+
+        // 2️⃣ 실제 캔들 덮어쓰기
+        for (int i = 1; i < candles.size(); i++) {
+            LocalDateTime t = getCandleTime(candles.get(i))
+                    .withSecond(0).withNano(0);
+
+            if (!t.isBefore(start) && t.isBefore(end)) {
+                map.put(t, getMinuteVolume(candles, i));
+            }
+        }
+
+        return map;
+    }
+
+    private double calculateSumVolumeNow(List<Candle> candles, int window) {
+        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
+        LocalDateTime start = now.minusMinutes(window);
+
+        double sum = 0;
+
+        for (int i = 1; i < candles.size(); i++) {
+            LocalDateTime t = getCandleTime(candles.get(i))
+                    .withSecond(0).withNano(0);
+
+            if (!t.isBefore(start) && t.isBefore(now)) {
+                sum += getMinuteVolume(candles, i);
+            }
+        }
+        return sum;
     }
 
     private LocalDateTime getCandleTime(Candle c) {

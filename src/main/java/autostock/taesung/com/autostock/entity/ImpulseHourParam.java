@@ -148,7 +148,7 @@ public class ImpulseHourParam {
      * - null 방어 처리 포함
      */
     public double getMinZScoreValue() {
-        return minZScore != null ? minZScore.doubleValue() : 1.5;
+        return minZScore != null ? minZScore.doubleValue() : 0.7;
     }
 
     /**
