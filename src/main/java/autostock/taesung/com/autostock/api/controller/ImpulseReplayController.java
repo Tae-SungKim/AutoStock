@@ -4,7 +4,7 @@ import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Market;
 import autostock.taesung.com.autostock.exchange.upbit.UpbitApiService;
 import autostock.taesung.com.autostock.strategy.impl.VolumeImpulseStrategy;
-import autostock.taesung.com.autostock.strategy.impl.VolumeImpulseStrategy.ReplayResult;
+import autostock.taesung.com.autostock.strategy.replay.ReplayResult;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
