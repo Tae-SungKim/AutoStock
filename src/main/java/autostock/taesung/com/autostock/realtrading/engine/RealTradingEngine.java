@@ -270,13 +270,38 @@ public class RealTradingEngine {
     }
 
     /**
+     * 관리자용 전체 포지션 요약 조회
+     */
+    public List<PositionSummary> getAllPositionSummary() {
+        // 활성 상태인 모든 포지션 조회
+        List<Position> allPositions = positionRepository.findAll().stream()
+                .filter(p -> p.getStatus() != PositionStatus.CLOSED)
+                .collect(Collectors.toList());
+
+        // 사용자별로 그룹화
+        Map<Long, List<Position>> positionsByUser = allPositions.stream()
+                .collect(Collectors.groupingBy(Position::getUserId));
+
+        // 각 사용자별 포지션 요약 생성
+        return positionsByUser.entrySet().stream()
+                .map(entry -> buildPositionSummary(entry.getKey(), entry.getValue()))
+                .collect(Collectors.toList());
+    }
+
+    /**
      * 사용자 포지션 요약 조회
      */
     public PositionSummary getPositionSummary(Long userId) {
         List<Position> positions = positionRepository.findByUserIdAndStatusIn(
                 userId, List.of(PositionStatus.PENDING, PositionStatus.ENTERING,
                         PositionStatus.ACTIVE, PositionStatus.EXITING));
+        return buildPositionSummary(userId, positions);
+    }
 
+    /**
+     * 포지션 요약 빌더 (공통)
+     */
+    private PositionSummary buildPositionSummary(Long userId, List<Position> positions) {
         BigDecimal totalInvested = BigDecimal.ZERO;
         BigDecimal totalUnrealizedPnl = BigDecimal.ZERO;
         BigDecimal totalRealizedPnl = BigDecimal.ZERO;

@@ -88,6 +88,15 @@ public class RealTradingController {
 
     // ==================== 포지션 관리 ====================
 
+    /**
+     * 관리자용 전체 포지션 조회
+     * - /positions/admin 경로는 /{userId} 보다 먼저 매칭되어야 함
+     */
+    @GetMapping("/positions/admin")
+    public ResponseEntity<ApiResponse<List<PositionSummary>>> getAllPositionSummary() {
+        return ResponseEntity.ok(ApiResponse.success(tradingEngine.getAllPositionSummary()));
+    }
+
     @GetMapping("/positions/{userId}")
     public ResponseEntity<ApiResponse<PositionSummary>> getPositionSummary(@PathVariable Long userId) {
         return ResponseEntity.ok(ApiResponse.success(tradingEngine.getPositionSummary(userId)));

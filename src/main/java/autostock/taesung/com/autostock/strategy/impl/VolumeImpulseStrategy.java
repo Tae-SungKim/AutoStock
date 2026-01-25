@@ -14,10 +14,7 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 
 /**
  * Volume Impulse 전략 (실거래 운영용)
@@ -267,7 +264,7 @@ public class VolumeImpulseStrategy implements TradingStrategy {
         double executionStrength = marketVolumeService.getExecutionStrength(market, EXEC_STRENGTH_SECONDS);
 
         if (executionStrength < minExecutionStrength) {
-            log.debug("REJECT,{},exec_str={}<{}",
+            log.info("REJECT,{},exec_str={}<{}",
                     market,
                     String.format("%.1f", executionStrength),
                     minExecutionStrength);
@@ -280,13 +277,13 @@ public class VolumeImpulseStrategy implements TradingStrategy {
         double dz = zScore - prevZ;
 
         if (zScore <= prevZ) {
-            log.debug("REJECT,{},z_not_increasing,Z={},prevZ={}", market,
+            log.info("REJECT,{},z_not_increasing,Z={},prevZ={}", market,
                     String.format("%.2f", zScore), String.format("%.2f", prevZ));
             return 0;
         }
 
         if (zScore < minZScore) {
-            log.debug("REJECT,{},z_low={}<{}", market,
+            log.info("REJECT,{},z_low={}<{}", market,
                     String.format("%.2f", zScore), minZScore);
             return 0;
         }
@@ -550,22 +547,31 @@ public class VolumeImpulseStrategy implements TradingStrategy {
      * @return Z-score
      */
     private double calculateTimeNormalizedZScore(List<Candle> candles, int window) {
-        if (candles.size() < 2) return 0;
+        if (candles == null || candles.size() < 2) return 0;
+
+        // 0️⃣ 시간 오름차순 정렬 (★★ 매우 중요 ★★)
+        candles.sort(Comparator.comparing(this::getCandleTime));
 
         int last = candles.size() - 1;
-        LocalDateTime endTime = getCandleTime(candles.get(last));
+
+        // 기준 시각 (마지막 캔들의 분 시작 시각)
+        LocalDateTime endTime = getCandleTime(candles.get(last))
+                .withSecond(0).withNano(0);
+
+        // window 분 전
         LocalDateTime startTime = endTime.minusMinutes(window);
 
-        // 1️⃣ 시간 슬롯 초기화 (모든 분 = 0)
+        // 1️⃣ 시간 슬롯 생성 (모든 분 = 0)
         Map<LocalDateTime, Double> volumeByMinute = new HashMap<>();
         for (int i = 0; i < window; i++) {
             volumeByMinute.put(startTime.plusMinutes(i), 0.0);
         }
 
-        // 2️⃣ 실제 캔들 덮어쓰기
+        // 2️⃣ 실제 캔들 덮어쓰기 (마지막 캔들은 제외)
         for (int i = 0; i < last; i++) {
             LocalDateTime t = getCandleTime(candles.get(i))
                     .withSecond(0).withNano(0);
+
             if (!t.isBefore(startTime) && t.isBefore(endTime)) {
                 volumeByMinute.put(
                         t,
@@ -574,20 +580,27 @@ public class VolumeImpulseStrategy implements TradingStrategy {
             }
         }
 
-        // 3️⃣ 평균
-        double sum = volumeByMinute.values().stream().mapToDouble(Double::doubleValue).sum();
+        // 3️⃣ 시간 정규화 평균
+        double sum = volumeByMinute.values()
+                .stream()
+                .mapToDouble(Double::doubleValue)
+                .sum();
+
         double mean = sum / window;
 
-        // 4️⃣ 분산
-        double variance = volumeByMinute.values().stream()
+        // 4️⃣ 시간 정규화 분산
+        double variance = volumeByMinute.values()
+                .stream()
                 .mapToDouble(v -> Math.pow(v - mean, 2))
                 .sum() / window;
 
         double std = Math.sqrt(variance);
         if (std == 0) return 0;
 
-        // 5️⃣ 현재 거래량
-        double curVolume = candles.get(last).getCandleAccTradeVolume().doubleValue();
+        // 5️⃣ 현재 거래량 (마지막 캔들)
+        double curVolume = candles.get(last)
+                .getCandleAccTradeVolume()
+                .doubleValue();
 
         return (curVolume - mean) / std;
     }
