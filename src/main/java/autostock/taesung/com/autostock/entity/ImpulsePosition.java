@@ -146,6 +146,13 @@ public class ImpulsePosition {
     @Column(precision = 20, scale = 8)
     private BigDecimal highestPrice;
 
+    /**
+     * 마지막 고점 갱신 시각
+     * - 트레일링 스탑 타임아웃 판단용
+     */
+    @Column
+    private LocalDateTime lastHighUpdateTime;
+
     // ==================== 청산 정보 ====================
 
     /** 청산 시각 */
@@ -210,9 +217,20 @@ public class ImpulsePosition {
     public boolean updateHighest(BigDecimal currentPrice) {
         if (this.highestPrice == null || currentPrice.compareTo(this.highestPrice) > 0) {
             this.highestPrice = currentPrice;
+            this.lastHighUpdateTime = LocalDateTime.now();
             return true;
         }
         return false;
+    }
+
+    /**
+     * 마지막 고점 갱신 이후 경과 시간 (초)
+     */
+    public long getSecondsSinceLastHighUpdate() {
+        if (this.lastHighUpdateTime == null) {
+            return getHoldingSeconds();
+        }
+        return java.time.Duration.between(this.lastHighUpdateTime, LocalDateTime.now()).getSeconds();
     }
 
     /**

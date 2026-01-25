@@ -1,62 +1,33 @@
 package autostock.taesung.com.autostock.strategy.impl;
 
-import autostock.taesung.com.autostock.entity.ImpulseHourParam;
 import autostock.taesung.com.autostock.entity.ImpulsePosition;
 import autostock.taesung.com.autostock.exchange.upbit.dto.Candle;
 import autostock.taesung.com.autostock.service.ImpulsePositionService;
-import autostock.taesung.com.autostock.service.ImpulseStatService;
-import autostock.taesung.com.autostock.service.MarketVolumeService;
 import autostock.taesung.com.autostock.strategy.TradingStrategy;
+import lombok.Builder;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 
 /**
- * Volume Impulse 전략 (실거래 운영용)
+ * Volume Impulse 전략 v2.0 (실거래 운영용)
  *
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * [핵심 설계: 업비트 분봉 데이터 특성 대응]
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * ★ 업비트는 거래가 없는 분에 캔들 데이터 자체를 반환하지 않음
- * ★ 단순 candle.size() 기반 평균 계산 시 유동성 착시 발생
- *
- * 예: 20분 중 5개 캔들만 존재, 총 거래량 100,000
- * - 잘못된 계산: 100,000 / 5 = 20,000 (높아 보임!)
- * - 올바른 계산: 100,000 / 20 = 5,000 (실제 유동성)
- *
- * 해결책:
- * 1. 시간 정규화 평균: sumVolume / window (캔들 개수 아님)
- * 2. 캔들 밀도 필터: density < 0.85 → 진입 금지
- * 3. 캔들 개수 검증: 최소 90% 캔들 필수
- *
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * [진입 조건] (ALL 충족)
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * 0. 캔들 밀도 >= 85% (유동성 검증 - 최우선)
- * 1. 절대 유동성: 현재 분 거래량 >= MIN_1M_VOLUME
- * 2. 누적 유동성: 20분 누적 거래량 >= MIN_SUM_VOLUME_20M
- * 3. 시간 정규화 평균: >= MIN_AVG_VOLUME_20M
- * 4. 상대 거래량: >= 시간 정규화 평균 × volumeMultiplier
- * 5. 가격 필터: 5분 상승률 < 2%
- * 6. 체결강도: >= minExecutionStrength
- * 7. Z-score: 증가 중 && >= minZScore
- *
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * [청산 조건]
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * 1. STOP_LOSS: 수익률 <= -1%
- * 2. FAKE_IMPULSE: 90초 이내 + Z-score 급감 + 상승률 부진
- * 3. Z_DROP: Z-score < entryZ × 50%
- * 4. TIMEOUT: 5분 경과
- * 5. WEAK_IMPULSE: 체결강도 급감
- *
- * @see ImpulsePositionService 포지션 영속화 서비스
- * @see ImpulseStatService 통계/캐시 서비스
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * [핵심 설계]
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * - 캔들 개수가 아닌 "현재 시간 기준 최근 N분" 윈도우
+ * - 시간 정규화 Z-score로 급등 판단
+ * - 급등 '초입'이 아닌 "급등이 확정된 직후" 진입
+ * - 트레일링 스탑 기반 청산 (고정 익절/손절 금지)
+ * - 가짜 급등 필터로 허위 신호 제거
  */
 @Component
 @RequiredArgsConstructor
@@ -64,28 +35,30 @@ import java.util.*;
 public class VolumeImpulseStrategy implements TradingStrategy {
 
     private final ImpulsePositionService positionService;
-    private final ImpulseStatService statService;
-    private final MarketVolumeService marketVolumeService;
 
-    private static final int Z_WINDOW = 20;
+    // ═══════════════════════════════════════════════════════════════
+    // 기본 파라미터
+    // ═══════════════════════════════════════════════════════════════
+    private static final int Z_WINDOW = 15;
+    private static final double Z_THRESHOLD = 1.75;
+    private static final double VOLUME_MULTIPLIER = 1.55;
+    private static final double DENSITY_THRESHOLD = 0.50;
 
-    private static final double MIN_CANDLE_DENSITY = 0.6;
-    private static final double MIN_CANDLE_RATIO = 0.75;
+    // ═══════════════════════════════════════════════════════════════
+    // 트레일링 스탑 파라미터
+    // ═══════════════════════════════════════════════════════════════
+    private static final double TRAILING_START_PROFIT = 0.003;   // 0.3% 수익부터 트레일링 시작
+    private static final double TRAILING_STOP_RATIO = 0.6;       // 고점 대비 60% 되돌림 시 청산
+    private static final int NO_HIGH_UPDATE_TIMEOUT_SEC = 300;   // 5분간 고점 갱신 없으면 청산
+    private static final double HARD_STOP_LOSS = -0.015;         // 최대 손실 제한 -1.5%
 
-    private static final int MIN_1M_VOLUME = 15_000;
-    private static final int MIN_SUM_VOLUME_20M = 150_000;
-    private static final int MIN_AVG_VOLUME_20M = 5_000;
-
-    private static final double MAX_PRICE_RISE_5M = 0.02;
-
-    private static final int EXEC_STRENGTH_SECONDS = 30;
-
-    private static final double STOP_LOSS_RATE = -0.01;
-    private static final int FAKE_CHECK_SECONDS = 90;
-    private static final double FAKE_Z_RATIO = 0.7;
-    private static final int MAX_HOLDING_MINUTES = 5;
-    private static final double Z_DROP_RATIO = 0.5;
-    private static final double WEAK_EXEC_STRENGTH = 50.0;
+    // ═══════════════════════════════════════════════════════════════
+    // 가짜 급등 필터 파라미터
+    // ═══════════════════════════════════════════════════════════════
+    private static final double LONG_WICK_RATIO = 0.6;           // 윗꼬리가 몸통의 60% 이상
+    private static final double CLOSE_HIGH_RATIO = 0.7;          // 종가가 (고가-저가)의 70% 이하
+    private static final double PREV_CLOSE_DROP = -0.003;        // 직전 대비 -0.3% 급락
+    private static final double MIN_PRICE_RISE_WITH_VOL = 0.002; // 거래량 급등 시 최소 0.2% 상승
 
     @Override
     public String getStrategyName() {
@@ -99,241 +72,429 @@ public class VolumeImpulseStrategy implements TradingStrategy {
 
     @Override
     public int analyze(String market, List<Candle> candles) {
-
         if (!market.startsWith("KRW-")) return 0;
-        if (candles.size() < Z_WINDOW + 5) return 0;
+        if (candles.size() < Z_WINDOW + 3) return 0;
 
-        int last = candles.size() - 1;
+        Candle lastCompleted = candles.get(candles.size() - 1);
+        double currentPrice = lastCompleted.getTradePrice().doubleValue();
+        LocalDateTime now = getCandleTime(lastCompleted);
 
-        Candle completed = candles.get(last - 1);
-        double price = completed.getTradePrice().doubleValue();
-
+        // 포지션 보유 중이면 청산 평가
         Optional<ImpulsePosition> posOpt = positionService.getOpenPosition(market);
         if (posOpt.isPresent()) {
-            return evaluateExit(market, candles, price, posOpt.get());
+            return evaluateExit(market, candles, currentPrice, now, posOpt.get());
         }
 
-        return evaluateEntry(market, candles, completed, price);
+        // 신규 진입 평가
+        return evaluateEntry(market, candles, lastCompleted, currentPrice, now);
     }
 
-    // =========================
-    // ENTRY
-    // =========================
-    private int evaluateEntry(String market, List<Candle> candles, Candle cur, double price) {
+    // ═══════════════════════════════════════════════════════════════
+    // 진입 판단 로직
+    // ═══════════════════════════════════════════════════════════════
+    private int evaluateEntry(String market, List<Candle> candles,
+                               Candle current, double price, LocalDateTime now) {
 
-        int last = candles.size() - 1;
+        // 1️⃣ 시간 정규화 Z-score 계산
+        ZScoreResult zResult = calculateTimeNormalizedZScore(candles, now, Z_WINDOW);
+        double z = zResult.zScore;
+        double density = zResult.density;
+        double avgVolume = zResult.avgVolume;
+        double currentVolume = zResult.currentVolume;
 
-        // 0️⃣ 캔들 밀도
-        double density = calculateCandleDensity(candles, Z_WINDOW);
-        if (density < MIN_CANDLE_DENSITY) return 0;
+        // 2️⃣ 직전 분 Z-score 계산 (상승 가속 확인용)
+        LocalDateTime prevMinute = now.minusMinutes(1);
+        ZScoreResult prevZResult = calculateTimeNormalizedZScore(candles, prevMinute, Z_WINDOW);
+        double prevZ = prevZResult.zScore;
 
-        if (!isCandleCountValid(candles, last, Z_WINDOW)) return 0;
+        // 3️⃣ 진입 조건 검증
+        EntryCheckResult check = checkEntryConditions(
+                z, prevZ, currentVolume, avgVolume, density, current, candles, now
+        );
 
-        ImpulseHourParam hourParam = statService.getHourParam(statService.getCurrentHour());
+        // 리플레이 로그 출력
+        logReplayData(market, now, currentVolume, avgVolume, z, prevZ, density, check);
 
-        double curVolume = getMinuteVolume(candles, candles.size() - 1);
-        if (curVolume < MIN_1M_VOLUME) return 0;
+        if (!check.passed) {
+            return 0;
+        }
 
-        double sumVolume = calculateSumVolumeNow(candles, Z_WINDOW);
-        if (sumVolume < MIN_SUM_VOLUME_20M) return 0;
+        // 4️⃣ 가짜 급등 필터
+        FakeImpulseResult fakeResult = checkFakeImpulse(current, candles, currentVolume, avgVolume);
+        if (fakeResult.isFake) {
+            log.info("[FAKE_FILTER] {} | reasons={}", market, fakeResult.reasons);
+            return 0;
+        }
 
-        double avgVolume = sumVolume / Z_WINDOW;
-        if (avgVolume < MIN_AVG_VOLUME_20M) return 0;
-
-        if (curVolume < avgVolume * hourParam.getVolumeMultiplierValue()) return 0;
-
-        double price5mAgo = candles.get(last - 6).getTradePrice().doubleValue();
-        if ((price - price5mAgo) / price5mAgo >= MAX_PRICE_RISE_5M) return 0;
-
-        double execStrength = marketVolumeService.getExecutionStrength(market, EXEC_STRENGTH_SECONDS);
-        if (execStrength < hourParam.getMinExecutionStrengthValue()) return 0;
-
-        // ⭐ Z-score 핵심 수정 ⭐
-        double z = calculateTimeNormalizedZScore(candles, Z_WINDOW);
-        double prevZ = calculateTimeNormalizedZScore(candles.subList(0, candles.size() - 1), Z_WINDOW);
-
-        //if (z <= prevZ) return 0;
-        //if (z < hourParam.getMinZScoreValue()) return 0;
-
+        // 5️⃣ 진입 실행
         positionService.openPosition(
                 market,
                 BigDecimal.valueOf(price),
                 BigDecimal.ONE,
                 z,
                 z - prevZ,
-                execStrength,
-                curVolume
+                0.0,  // 체결강도 (별도 서비스에서 조회 시 사용)
+                currentVolume
         );
 
-        log.info("ENTRY,{},price={},Z={},dZ={},vol={},density={}",
+        log.info("[ENTRY] {} | price={} | Z={} | dZ={} | vol={} | avgVol={} | density={}",
                 market,
-                price,
+                String.format("%.4f", price),
                 String.format("%.2f", z),
                 String.format("%.2f", z - prevZ),
-                curVolume,
+                String.format("%.0f", currentVolume),
+                String.format("%.0f", avgVolume),
                 String.format("%.2f", density)
         );
 
         return 1;
     }
 
-    // =========================
-    // EXIT
-    // =========================
-    private int evaluateExit(String market, List<Candle> candles, double price, ImpulsePosition pos) {
+    // ═══════════════════════════════════════════════════════════════
+    // 청산 판단 로직 (트레일링 스탑 기반)
+    // ═══════════════════════════════════════════════════════════════
+    private int evaluateExit(String market, List<Candle> candles,
+                              double price, LocalDateTime now, ImpulsePosition pos) {
 
         BigDecimal curPrice = BigDecimal.valueOf(price);
-        double pnl = pos.getCurrentProfitRate(curPrice).doubleValue();
+        double profitRate = pos.getCurrentProfitRate(curPrice).doubleValue();
+        long holdingSec = pos.getHoldingSeconds();
 
-        long sec = pos.getHoldingSeconds();
-        long min = pos.getHoldingMinutes();
+        // 고점 갱신
+        boolean highUpdated = pos.updateHighest(curPrice);
+        if (highUpdated) {
+            positionService.updateHighest(market, curPrice);
+        }
 
-        if (pnl <= STOP_LOSS_RATE) {
-            positionService.closeWithStopLoss(market, curPrice);
+        // 1️⃣ 하드 손절 (급등 실패 판단)
+        if (profitRate <= HARD_STOP_LOSS) {
+            positionService.closePosition(market, curPrice, "HARD_STOP_LOSS");
+            log.info("[EXIT] {} | reason=HARD_STOP_LOSS | pnl={}",
+                    market, String.format("%.2f%%", profitRate * 100));
             return -1;
         }
 
-        double z = calculateTimeNormalizedZScore(candles, Z_WINDOW);
+        // 2️⃣ 트레일링 스탑 체크
+        if (profitRate >= TRAILING_START_PROFIT && pos.getHighestPrice() != null) {
+            double highestProfit = pos.getHighestPrice().subtract(pos.getEntryPrice())
+                    .divide(pos.getEntryPrice(), 6, RoundingMode.HALF_UP)
+                    .doubleValue();
+
+            double drawdown = highestProfit - profitRate;
+            double allowedDrawdown = highestProfit * (1 - TRAILING_STOP_RATIO);
+
+            if (drawdown > allowedDrawdown && drawdown > 0.002) {
+                positionService.closePosition(market, curPrice, "TRAILING_STOP");
+                log.info("[EXIT] {} | reason=TRAILING_STOP | pnl={} | highPnl={}",
+                        market,
+                        String.format("%.2f%%", profitRate * 100),
+                        String.format("%.2f%%", highestProfit * 100));
+                return -1;
+            }
+        }
+
+        // 3️⃣ 고점 갱신 없음 타임아웃 (모멘텀 소멸)
+        long secSinceLastHigh = pos.getSecondsSinceLastHighUpdate();
+        if (secSinceLastHigh > NO_HIGH_UPDATE_TIMEOUT_SEC) {
+            String reason = profitRate > 0 ? "TIMEOUT_PROFIT" : "TIMEOUT_LOSS";
+            positionService.closePosition(market, curPrice, reason);
+            log.info("[EXIT] {} | reason={} | pnl={} | secSinceHigh={}",
+                    market, reason,
+                    String.format("%.2f%%", profitRate * 100), secSinceLastHigh);
+            return -1;
+        }
+
+        // 4️⃣ Z-score 급락 체크 (급등 실패)
+        ZScoreResult zResult = calculateTimeNormalizedZScore(candles, now, Z_WINDOW);
         double entryZ = pos.getEntryZScore().doubleValue();
 
-        if (sec <= FAKE_CHECK_SECONDS && z < entryZ * FAKE_Z_RATIO) {
-            positionService.closeWithFakeImpulse(market, curPrice);
-            return -1;
-        }
-
-        if (z < entryZ * Z_DROP_RATIO) {
-            positionService.closePosition(market, curPrice, "Z_DROP");
-            return -1;
-        }
-
-        if (min >= MAX_HOLDING_MINUTES) {
-            positionService.closePosition(market, curPrice, "TIMEOUT");
-            return -1;
-        }
-
-        double exec = marketVolumeService.getExecutionStrength(market, EXEC_STRENGTH_SECONDS);
-        if (sec > 60 && exec < WEAK_EXEC_STRENGTH) {
-            positionService.closePosition(market, curPrice, "WEAK_IMPULSE");
+        if (zResult.zScore < entryZ * 0.4 && holdingSec > 60) {
+            positionService.closePosition(market, curPrice, "Z_COLLAPSE");
+            log.info("[EXIT] {} | reason=Z_COLLAPSE | pnl={} | Z={} | entryZ={}",
+                    market,
+                    String.format("%.2f%%", profitRate * 100),
+                    String.format("%.2f", zResult.zScore),
+                    String.format("%.2f", entryZ));
             return -1;
         }
 
         return 0;
     }
 
-    // =========================
-    // UTIL
-    // =========================
-    private double calculateSumVolume(List<Candle> candles, int last, int window) {
-        int start = Math.max(1, last - window + 1);
-        double sum = 0;
-        for (int i = start; i <= last; i++) {
-            sum += getMinuteVolume(candles, i);
-        }
-        return sum;
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // 시간 정규화 Z-score 계산
+    // ═══════════════════════════════════════════════════════════════
+    private ZScoreResult calculateTimeNormalizedZScore(List<Candle> candles,
+                                                        LocalDateTime baseTime, int window) {
+        LocalDateTime windowStart = baseTime.minusMinutes(window);
 
-    private double calculateTimeNormalizedZScore(List<Candle> candles, int window) {
-        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
-        LocalDateTime start = now.minusMinutes(window);
-
-        Map<LocalDateTime, Double> volumeMap =
-                buildMinuteVolumeMapNowBase(candles, start, now, window);
-
-        double mean = volumeMap.values().stream()
-                .mapToDouble(v -> v)
-                .average()
-                .orElse(0);
-
-        double variance = volumeMap.values().stream()
-                .mapToDouble(v -> Math.pow(v - mean, 2))
-                .average()
-                .orElse(0);
-
-        double std = Math.sqrt(variance);
-        if (std == 0) return 0;
-
-        // 현재 분 거래량 (now-1분 기준)
-        double curVol = volumeMap.getOrDefault(
-                now.minusMinutes(1), 0.0
-        );
-
-        return (curVol - mean) / std;
-    }
-
-    private double calculateCandleDensity(List<Candle> candles, int window) {
-        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
-        LocalDateTime start = now.minusMinutes(window);
-
-        long count = candles.stream()
-                .map(this::getCandleTime)
-                .map(t -> t.withSecond(0).withNano(0))
-                .filter(t -> !t.isBefore(start) && t.isBefore(now))
-                .distinct()
-                .count();
-
-        return count / (double) window;
-    }
-
-    private boolean isCandleCountValid(List<Candle> candles, int last, int window) {
-        LocalDateTime end = getCandleTime(candles.get(last));
-        LocalDateTime start = end.minusMinutes(window);
-
-        long count = candles.stream()
-                .map(this::getCandleTime)
-                .filter(t -> !t.isBefore(start))
-                .count();
-
-        return count >= window * MIN_CANDLE_RATIO;
-    }
-
-    private double getMinuteVolume(List<Candle> candles, int idx) {
-        if (idx == 0) return 0;
-        double cur = candles.get(idx).getCandleAccTradeVolume().doubleValue();
-        double prev = candles.get(idx - 1).getCandleAccTradeVolume().doubleValue();
-        return Math.max(0, cur - prev);
-    }
-
-    private Map<LocalDateTime, Double> buildMinuteVolumeMapNowBase(
-            List<Candle> candles,
-            LocalDateTime start,
-            LocalDateTime end,
-            int window
-    ) {
-        Map<LocalDateTime, Double> map = new HashMap<>();
-
-        // 1️⃣ 모든 분 슬롯 0으로 초기화
+        // 1️⃣ 모든 분 슬롯을 0으로 초기화
+        Map<LocalDateTime, Double> volumeMap = new LinkedHashMap<>();
         for (int i = 0; i < window; i++) {
-            map.put(start.plusMinutes(i), 0.0);
+            volumeMap.put(windowStart.plusMinutes(i), 0.0);
         }
 
-        // 2️⃣ 실제 캔들 덮어쓰기
+        // 2️⃣ 실제 캔들 거래량으로 덮어쓰기
+        int actualCandleCount = 0;
         for (int i = 1; i < candles.size(); i++) {
-            LocalDateTime t = getCandleTime(candles.get(i))
-                    .withSecond(0).withNano(0);
+            LocalDateTime candleTime = getCandleTime(candles.get(i)).withSecond(0).withNano(0);
 
-            if (!t.isBefore(start) && t.isBefore(end)) {
-                map.put(t, getMinuteVolume(candles, i));
+            if (!candleTime.isBefore(windowStart) && candleTime.isBefore(baseTime)) {
+                double vol = getMinuteVolume(candles, i);
+                volumeMap.put(candleTime, vol);
+                if (vol > 0) actualCandleCount++;
             }
         }
 
-        return map;
+        // 3️⃣ 현재 거래량 (마지막 완성 캔들)
+        double currentVolume = 0;
+        for (int i = candles.size() - 1; i >= 1; i--) {
+            LocalDateTime candleTime = getCandleTime(candles.get(i)).withSecond(0).withNano(0);
+            if (candleTime.equals(baseTime.minusMinutes(1)) || candleTime.equals(baseTime)) {
+                currentVolume = getMinuteVolume(candles, i);
+                break;
+            }
+        }
+
+        // 4️⃣ 평균, 표준편차 계산 (window 기준)
+        double sum = volumeMap.values().stream().mapToDouble(v -> v).sum();
+        double mean = sum / window;
+
+        double varianceSum = volumeMap.values().stream()
+                .mapToDouble(v -> Math.pow(v - mean, 2))
+                .sum();
+        double std = Math.sqrt(varianceSum / window);
+
+        // 5️⃣ Z-score 계산
+        double zScore = (std > 0) ? (currentVolume - mean) / std : 0;
+        double density = (double) actualCandleCount / window;
+
+        return ZScoreResult.builder()
+                .zScore(zScore)
+                .density(density)
+                .avgVolume(mean)
+                .currentVolume(currentVolume)
+                .std(std)
+                .build();
     }
 
-    private double calculateSumVolumeNow(List<Candle> candles, int window) {
-        LocalDateTime now = LocalDateTime.now().withSecond(0).withNano(0);
-        LocalDateTime start = now.minusMinutes(window);
+    // ═══════════════════════════════════════════════════════════════
+    // 진입 조건 검증
+    // ═══════════════════════════════════════════════════════════════
+    private EntryCheckResult checkEntryConditions(double z, double prevZ,
+                                                   double currentVol, double avgVol,
+                                                   double density, Candle current,
+                                                   List<Candle> candles, LocalDateTime now) {
+        List<String> failReasons = new ArrayList<>();
 
-        double sum = 0;
+        // 조건 1: Z-score > threshold
+        if (z <= Z_THRESHOLD) {
+            failReasons.add(String.format("Z=%.2f<=%.2f", z, Z_THRESHOLD));
+        }
 
-        for (int i = 1; i < candles.size(); i++) {
-            LocalDateTime t = getCandleTime(candles.get(i))
-                    .withSecond(0).withNano(0);
+        // 조건 2: Z-score 상승 가속
+        if (z <= prevZ) {
+            failReasons.add(String.format("Z_NOT_RISING(%.2f<=%.2f)", z, prevZ));
+        }
 
-            if (!t.isBefore(start) && t.isBefore(now)) {
-                sum += getMinuteVolume(candles, i);
+        // 조건 3: 현재 거래량 > 평균 * multiplier
+        double volumeThreshold = avgVol * VOLUME_MULTIPLIER;
+        if (currentVol <= volumeThreshold) {
+            failReasons.add(String.format("VOL=%.0f<=%.0f", currentVol, volumeThreshold));
+        }
+
+        // 조건 4: 캔들 밀도 >= threshold
+        if (density < DENSITY_THRESHOLD) {
+            failReasons.add(String.format("DENSITY=%.2f<%.2f", density, DENSITY_THRESHOLD));
+        }
+
+        return EntryCheckResult.builder()
+                .passed(failReasons.isEmpty())
+                .failReasons(failReasons)
+                .build();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 가짜 급등 필터 (2개 이상 만족 시 진입 금지)
+    // ═══════════════════════════════════════════════════════════════
+    private FakeImpulseResult checkFakeImpulse(Candle current, List<Candle> candles,
+                                                double currentVol, double avgVol) {
+        List<String> reasons = new ArrayList<>();
+
+        double open = current.getOpeningPrice().doubleValue();
+        double high = current.getHighPrice().doubleValue();
+        double low = current.getLowPrice().doubleValue();
+        double close = current.getTradePrice().doubleValue();
+        double body = Math.abs(close - open);
+        double upperWick = high - Math.max(open, close);
+        double range = high - low;
+
+        // 1️⃣ 긴 윗꼬리
+        if (body > 0 && upperWick / body >= LONG_WICK_RATIO) {
+            reasons.add("LONG_UPPER_WICK");
+        }
+
+        // 2️⃣ 종가가 고가의 일정 비율 이하
+        if (range > 0 && (close - low) / range < CLOSE_HIGH_RATIO) {
+            reasons.add("CLOSE_NEAR_LOW");
+        }
+
+        // 3️⃣ 직전 캔들 대비 종가 급락
+        if (candles.size() >= 2) {
+            Candle prev = candles.get(candles.size() - 2);
+            double prevClose = prev.getTradePrice().doubleValue();
+            double changeRate = (close - prevClose) / prevClose;
+            if (changeRate <= PREV_CLOSE_DROP) {
+                reasons.add("PREV_CLOSE_DROP");
             }
         }
-        return sum;
+
+        // 4️⃣ 거래량은 크지만 가격 상승폭 미미
+        if (currentVol > avgVol * 2) {
+            double priceRise = (close - open) / open;
+            if (priceRise < MIN_PRICE_RISE_WITH_VOL) {
+                reasons.add("VOL_BUT_NO_RISE");
+            }
+        }
+
+        return FakeImpulseResult.builder()
+                .isFake(reasons.size() >= 2)
+                .reasons(reasons)
+                .build();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 리플레이 분석 로그
+    // ═══════════════════════════════════════════════════════════════
+    private void logReplayData(String market, LocalDateTime time,
+                                double currentVol, double avgVol,
+                                double z, double prevZ, double density,
+                                EntryCheckResult check) {
+        String entryStatus = check.passed ? "ENTRY" : "NO_ENTRY";
+        String reason = check.passed ? "-" : String.join(",", check.failReasons);
+
+        log.debug("[REPLAY] {} | {} | vol={} | avgVol={} | Z={} | prevZ={} | density={} | {} | {}",
+                market,
+                time.toString(),
+                String.format("%.0f", currentVol),
+                String.format("%.0f", avgVol),
+                String.format("%.2f", z),
+                String.format("%.2f", prevZ),
+                String.format("%.2f", density),
+                entryStatus,
+                reason
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 급등 리플레이 시뮬레이션 (외부 호출용)
+    // ═══════════════════════════════════════════════════════════════
+    public List<ReplayResult> runReplay(String market, List<Candle> candles) {
+        List<ReplayResult> results = new ArrayList<>();
+
+        if (candles.size() < Z_WINDOW + 3) {
+            return results;
+        }
+
+        for (int i = Z_WINDOW + 2; i < candles.size(); i++) {
+            List<Candle> subCandles = candles.subList(0, i + 1);
+            Candle current = subCandles.get(subCandles.size() - 1);
+            LocalDateTime now = getCandleTime(current);
+            double price = current.getTradePrice().doubleValue();
+
+            ZScoreResult zResult = calculateTimeNormalizedZScore(subCandles, now, Z_WINDOW);
+            ZScoreResult prevZResult = calculateTimeNormalizedZScore(subCandles, now.minusMinutes(1), Z_WINDOW);
+
+            EntryCheckResult check = checkEntryConditions(
+                    zResult.zScore, prevZResult.zScore,
+                    zResult.currentVolume, zResult.avgVolume,
+                    zResult.density, current, subCandles, now
+            );
+
+            FakeImpulseResult fakeResult = checkFakeImpulse(
+                    current, subCandles, zResult.currentVolume, zResult.avgVolume
+            );
+
+            String decision;
+            String reason;
+            if (!check.passed) {
+                decision = "NO_ENTRY";
+                reason = String.join(",", check.failReasons);
+            } else if (fakeResult.isFake) {
+                decision = "FAKE_FILTERED";
+                reason = String.join(",", fakeResult.reasons);
+            } else {
+                decision = "ENTRY";
+                reason = "-";
+            }
+
+            results.add(ReplayResult.builder()
+                    .time(now)
+                    .price(price)
+                    .currentVolume(zResult.currentVolume)
+                    .avgVolume(zResult.avgVolume)
+                    .zScore(zResult.zScore)
+                    .prevZScore(prevZResult.zScore)
+                    .density(zResult.density)
+                    .decision(decision)
+                    .reason(reason)
+                    .build());
+        }
+
+        return results;
+    }
+
+    /**
+     * 리플레이 결과 로그 출력
+     */
+    public void printReplayLog(String market, List<ReplayResult> results) {
+        log.info("═══════════════════════════════════════════════════════════════");
+        log.info("[REPLAY START] {}", market);
+        log.info("═══════════════════════════════════════════════════════════════");
+        log.info("{}", String.format("%-20s | %10s | %10s | %10s | %6s | %6s | %6s | %-15s | %s",
+                "TIME", "PRICE", "VOL", "AVG_VOL", "Z", "PREV_Z", "DENS", "DECISION", "REASON"));
+        log.info("───────────────────────────────────────────────────────────────");
+
+        for (ReplayResult r : results) {
+            log.info("{}", String.format("%-20s | %10.4f | %10.0f | %10.0f | %6.2f | %6.2f | %6.2f | %-15s | %s",
+                    r.time.toString(),
+                    r.price,
+                    r.currentVolume,
+                    r.avgVolume,
+                    r.zScore,
+                    r.prevZScore,
+                    r.density,
+                    r.decision,
+                    r.reason));
+        }
+
+        long entryCount = results.stream().filter(r -> "ENTRY".equals(r.decision)).count();
+        log.info("───────────────────────────────────────────────────────────────");
+        log.info("[REPLAY END] Total={}, Entries={}", results.size(), entryCount);
+        log.info("═══════════════════════════════════════════════════════════════");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 유틸리티 메서드
+    // ═══════════════════════════════════════════════════════════════
+    private double getMinuteVolume(List<Candle> candles, int idx) {
+        if (idx <= 0) return 0;
+
+        Candle cur = candles.get(idx);
+        Candle prev = candles.get(idx - 1);
+
+        LocalDateTime curTime = getCandleTime(cur).truncatedTo(ChronoUnit.MINUTES);
+        LocalDateTime prevTime = getCandleTime(prev).truncatedTo(ChronoUnit.MINUTES);
+
+        // 연속된 캔들인 경우에만 차이 계산
+        if (ChronoUnit.MINUTES.between(prevTime, curTime) == 1) {
+            double curAcc = cur.getCandleAccTradeVolume().doubleValue();
+            double prevAcc = prev.getCandleAccTradeVolume().doubleValue();
+            return Math.max(0, curAcc - prevAcc);
+        }
+
+        // 비연속 캔들 → 해당 캔들 전체 거래량 사용
+        return cur.getCandleAccTradeVolume().doubleValue();
     }
 
     private LocalDateTime getCandleTime(Candle c) {
@@ -341,5 +502,46 @@ public class VolumeImpulseStrategy implements TradingStrategy {
         if (t instanceof LocalDateTime) return (LocalDateTime) t;
         if (t instanceof OffsetDateTime) return ((OffsetDateTime) t).toLocalDateTime();
         return LocalDateTime.parse(t.toString());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 내부 DTO
+    // ═══════════════════════════════════════════════════════════════
+    @Data
+    @Builder
+    private static class ZScoreResult {
+        private double zScore;
+        private double density;
+        private double avgVolume;
+        private double currentVolume;
+        private double std;
+    }
+
+    @Data
+    @Builder
+    private static class EntryCheckResult {
+        private boolean passed;
+        private List<String> failReasons;
+    }
+
+    @Data
+    @Builder
+    private static class FakeImpulseResult {
+        private boolean isFake;
+        private List<String> reasons;
+    }
+
+    @Data
+    @Builder
+    public static class ReplayResult {
+        private LocalDateTime time;
+        private double price;
+        private double currentVolume;
+        private double avgVolume;
+        private double zScore;
+        private double prevZScore;
+        private double density;
+        private String decision;
+        private String reason;
     }
 }
