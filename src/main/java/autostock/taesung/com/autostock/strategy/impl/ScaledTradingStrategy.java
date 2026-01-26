@@ -20,6 +20,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -90,9 +91,10 @@ public class ScaledTradingStrategy implements TradingStrategy {
 
         // 거래대금 체크
         double currentVolume = candles.get(0).getCandleAccTradePrice().doubleValue();
-        double avgVolume = candles.subList(1, 6).stream()
-                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
-                .average().orElse(1.0);
+        LocalDateTime now = getCandleTime(candles.get(0));
+
+        double avgVolume =
+                calcAvgTradePriceByMinutes(candles, now, 6);
 
         // ========== 보유 중일 때: 청산 로직 ==========
         if (holding) {
@@ -374,6 +376,30 @@ public class ScaledTradingStrategy implements TradingStrategy {
         if (hour >= 9 && hour < 18) return 50_000_000;
         if (hour >= 18 && hour < 22) return 80_000_000;
         return 100_000_000;
+    }
+
+    private double calcAvgTradePriceByMinutes(
+            List<Candle> candles,
+            LocalDateTime baseTime,
+            int minutes
+    ) {
+        LocalDateTime from = baseTime.minusMinutes(minutes);
+
+        return candles.stream()
+                .filter(c -> {
+                    LocalDateTime t = getCandleTime(c);
+                    return !t.isBefore(from) && t.isBefore(baseTime);
+                })
+                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
+                .average()
+                .orElse(1.0);
+    }
+
+    private LocalDateTime getCandleTime(Candle c) {
+        Object t = c.getCandleDateTimeKst();
+        if (t instanceof LocalDateTime) return (LocalDateTime) t;
+        if (t instanceof OffsetDateTime) return ((OffsetDateTime) t).toLocalDateTime();
+        return LocalDateTime.parse(t.toString());
     }
 
     /**
