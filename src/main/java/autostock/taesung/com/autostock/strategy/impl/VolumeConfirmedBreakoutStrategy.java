@@ -16,7 +16,6 @@ import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Slf4j
 @Component
@@ -27,149 +26,126 @@ public class VolumeConfirmedBreakoutStrategy implements TradingStrategy {
     private final StrategyReplayLogService replayLogService;
     private final UpbitOrderbookService orderbookService;
 
-    /** 현재 세션 ID */
     private final String sessionId = UUID.randomUUID().toString().substring(0, 8);
+    private final Map<String, Double> prevExecMap = new HashMap<>();
 
     /** DB 저장 활성화 */
     @Setter
     private boolean dbLoggingEnabled = true;
 
-    /* ==============================
-     * 🔁 Replay Log
-     * ============================== */
+    /** 리플레이 로그 DTO */
     @Getter
     @Builder
     public static class ReplayLog {
         LocalDateTime time;
         String market;
         String action;
+        String reason;
         double price;
         double rsi;
         double atr;
         double volumeRatio;
-        double density;
         double executionStrength;
         Double profitRate;
     }
 
     private final List<ReplayLog> replayLogs = new ArrayList<>();
 
+    /** 현재 세션 ID 조회 */
+    public String getSessionId() {
+        return sessionId;
+    }
+
+    /** 메모리 로그 가져오기 */
+    public List<ReplayLog> getReplayLogs() {
+        return new ArrayList<>(replayLogs);
+    }
+
+    /** 메모리 로그 클리어 */
+    public void clearReplayLogs() {
+        replayLogs.clear();
+    }
+
     /* ==============================
-     * ⚙️ 전략 파라미터
+     * 장 상태
+     * ============================== */
+    private enum MarketRegime {
+        BULL, SIDEWAYS, BEAR
+    }
+
+    /* ==============================
+     * 파라미터
      * ============================== */
     private static final int RSI_MINUTES = 14;
     private static final int ATR_MINUTES = 14;
+    private static final int REGIME_MINUTES = 20;
 
-    private static final int MARKET_CHECK_MINUTES = 10;
-    private static final double MIN_MARKET_DENSITY = 0.45;
-    private static final double MIN_MARKET_AVG_VOLUME = 5_000_000;
-
-    private static final int FAKE_PUMP_MINUTES = 3;
-    private static final double FAKE_PRICE_CHANGE = 0.006;
-    private static final double FAKE_MIN_DENSITY = 0.30;
-
-    private static final double MIN_EXECUTION_STRENGTH = 0.58;
+    private static final double MIN_EXEC_STRENGTH = 0.58;
+    private static final double EXIT_EXEC_STRENGTH = 0.45;
+    private static final double EXIT_VOL_DROP = 0.7;
 
     /* ==============================
-     * 🕒 시간 처리
+     * 시간
      * ============================== */
-    private LocalDateTime getTime(Candle c) {
+    private LocalDateTime time(Candle c) {
         Object t = c.getCandleDateTimeKst();
         if (t instanceof LocalDateTime) return (LocalDateTime) t;
         if (t instanceof OffsetDateTime) return ((OffsetDateTime) t).toLocalDateTime();
         return LocalDateTime.parse(t.toString());
     }
 
-    private List<Candle> sliceByMinutes(List<Candle> candles, LocalDateTime now, int minutes) {
-        LocalDateTime from = now.minusMinutes(minutes);
+    private List<Candle> slice(List<Candle> candles, LocalDateTime now, int min) {
+        LocalDateTime from = now.minusMinutes(min);
         return candles.stream()
                 .filter(c -> {
-                    LocalDateTime t = getTime(c);
+                    LocalDateTime t = time(c);
                     return !t.isBefore(from) && !t.isAfter(now);
-                })
-                .toList();
+                }).toList();
     }
 
     /* ==============================
-     * 📊 지표 계산
+     * 지표
      * ============================== */
-    private double calculateRSI(List<Candle> candles, LocalDateTime now, int minutes) {
-        List<Candle> w = sliceByMinutes(candles, now, minutes);
+    private double rsi(List<Candle> c, LocalDateTime n, int m) {
+        List<Candle> w = slice(c, n, m);
         if (w.size() < 3) return 50;
 
-        double gain = 0, loss = 0;
+        double g = 0, l = 0;
         for (int i = 0; i < w.size() - 1; i++) {
-            double diff = w.get(i).getTradePrice().doubleValue()
+            double d = w.get(i).getTradePrice().doubleValue()
                     - w.get(i + 1).getTradePrice().doubleValue();
-            if (diff > 0) gain += diff;
-            else loss -= diff;
+            if (d > 0) g += d;
+            else l -= d;
         }
-        return loss == 0 ? 100 : 100 - (100 / (1 + gain / loss));
+        return l == 0 ? 100 : 100 - (100 / (1 + g / l));
     }
 
-    private double calculateATR(List<Candle> candles, LocalDateTime now, int minutes) {
-        List<Candle> w = sliceByMinutes(candles, now, minutes);
+    private double atr(List<Candle> c, LocalDateTime n, int m) {
+        List<Candle> w = slice(c, n, m);
         if (w.size() < 2) return 0;
 
         double sum = 0;
         for (int i = 0; i < w.size() - 1; i++) {
-            Candle c = w.get(i);
-            Candle p = w.get(i + 1);
-            double h = c.getHighPrice().doubleValue();
-            double l = c.getLowPrice().doubleValue();
-            double pc = p.getTradePrice().doubleValue();
+            Candle cur = w.get(i);
+            Candle prev = w.get(i + 1);
+            double h = cur.getHighPrice().doubleValue();
+            double l = cur.getLowPrice().doubleValue();
+            double pc = prev.getTradePrice().doubleValue();
             sum += Math.max(h - l, Math.max(Math.abs(h - pc), Math.abs(l - pc)));
         }
         return sum / w.size();
     }
 
     /* ==============================
-     * ⏱ 밀도 / 필터
+     * 체결 강도
      * ============================== */
-    private double minuteDensity(List<Candle> candles, LocalDateTime now, int minutes) {
-        Set<LocalDateTime> set = sliceByMinutes(candles, now, minutes).stream()
-                .map(c -> getTime(c).truncatedTo(ChronoUnit.MINUTES))
-                .collect(Collectors.toSet());
-        return set.size() / (double) minutes;
-    }
-
-    private boolean isBadMarket(List<Candle> candles, LocalDateTime now) {
-        List<Candle> w = sliceByMinutes(candles, now, MARKET_CHECK_MINUTES);
-        if (w.isEmpty()) return true;
-
-        double density = minuteDensity(candles, now, MARKET_CHECK_MINUTES);
-        double avgVolume = w.stream()
-                .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
-                .average().orElse(0);
-
-        return density < MIN_MARKET_DENSITY || avgVolume < MIN_MARKET_AVG_VOLUME;
-    }
-
-    private boolean isFakePump(List<Candle> candles, LocalDateTime now) {
-        List<Candle> w = sliceByMinutes(candles, now, FAKE_PUMP_MINUTES);
-        if (w.size() < 2) return false;
-
-        double first = w.get(w.size() - 1).getTradePrice().doubleValue();
-        double last = w.get(0).getTradePrice().doubleValue();
-        double change = (last - first) / first;
-
-        double density = minuteDensity(candles, now, FAKE_PUMP_MINUTES);
-        return change >= FAKE_PRICE_CHANGE && density < FAKE_MIN_DENSITY;
-    }
-
-    /* ==============================
-     * 🔥 체결 강도 (호가창 기반)
-     * ============================== */
-    private double executionStrength(String market) {
+    private double execStrength(String market) {
         try {
             var ob = orderbookService.getOrderbook(market);
-            if (ob == null || ob.getOrderbookUnits() == null || ob.getOrderbookUnits().isEmpty()) {
-                return 0.5;
-            }
+            if (ob == null || ob.getOrderbookUnits() == null) return 0.5;
 
             double bid = 0, ask = 0;
-            int count = Math.min(3, ob.getOrderbookUnits().size());
-            for (int i = 0; i < count; i++) {
+            for (int i = 0; i < Math.min(3, ob.getOrderbookUnits().size()); i++) {
                 bid += ob.getBidSize(i);
                 ask += ob.getAskSize(i);
             }
@@ -180,8 +156,25 @@ public class VolumeConfirmedBreakoutStrategy implements TradingStrategy {
     }
 
     /* ==============================
-     * 🚀 메인 로직
+     * 🔥 자동 장 분류
      * ============================== */
+    private MarketRegime detectRegime(List<Candle> candles, LocalDateTime now) {
+        List<Candle> w = slice(candles, now, REGIME_MINUTES);
+        if (w.size() < 5) return MarketRegime.SIDEWAYS;
+
+        double first = w.get(w.size() - 1).getTradePrice().doubleValue();
+        double last = w.get(0).getTradePrice().doubleValue();
+        double change = (last - first) / first;
+
+        if (change > 0.004) return MarketRegime.BULL;
+        if (change < -0.004) return MarketRegime.BEAR;
+        return MarketRegime.SIDEWAYS;
+    }
+
+    /* ==============================
+     * 메인
+     * ============================== */
+
     @Override
     public int analyze(List<Candle> candles) {
         return analyze("UNKNOWN", candles);
@@ -190,11 +183,11 @@ public class VolumeConfirmedBreakoutStrategy implements TradingStrategy {
     @Override
     public int analyze(String market, List<Candle> candles) {
 
-        if (candles.size() < 10) return 0;
-
         Candle cur = candles.get(0);
-        LocalDateTime now = getTime(cur);
+        LocalDateTime now = time(cur);
         double price = cur.getTradePrice().doubleValue();
+
+        MarketRegime regime = detectRegime(candles, now);
 
         TradeHistory last =
                 tradeHistoryRepository.findLatestByMarket(market)
@@ -202,56 +195,66 @@ public class VolumeConfirmedBreakoutStrategy implements TradingStrategy {
 
         boolean holding = last != null && last.getTradeType() == TradeHistory.TradeType.BUY;
 
-        double rsi = calculateRSI(candles, now, RSI_MINUTES);
-        double atr = calculateATR(candles, now, ATR_MINUTES);
-        double density = minuteDensity(candles, now, MARKET_CHECK_MINUTES);
+        double rsi = rsi(candles, now, RSI_MINUTES);
+        double atr = atr(candles, now, ATR_MINUTES);
 
-        List<Candle> last5m = sliceByMinutes(candles, now, 5);
-        double avgVol = last5m.stream()
+        List<Candle> last5 = slice(candles, now, 5);
+        double avgVol = last5.stream()
                 .mapToDouble(c -> c.getCandleAccTradePrice().doubleValue())
                 .average().orElse(1);
-        double volRatio = cur.getCandleAccTradePrice().doubleValue() / avgVol;
 
-        double execStrength = executionStrength(market);
+        double curVol = cur.getCandleAccTradePrice().doubleValue();
+        double volRatio = curVol / avgVol;
+
+        double exec = execStrength(market);
+        double prevExec = prevExecMap.getOrDefault(market, exec);
+        prevExecMap.put(market, exec);
 
         /* ======================
-         * 💣 매도
+         * EXIT
          * ====================== */
         if (holding) {
             double buy = last.getPrice().doubleValue();
-            double high = Optional.ofNullable(last.getHighestPrice())
-                    .map(BigDecimal::doubleValue)
-                    .orElse(buy);
+            double profit = (price - buy) / buy;
 
-            if (price > high) {
-                last.setHighestPrice(BigDecimal.valueOf(price));
-                tradeHistoryRepository.save(last);
-                high = price;
-            }
-
-            double profitRate = (price - buy) / buy;
-
-            if (price <= buy - atr * 2.0 || price <= high - atr * 1.5) {
-                replayLogs.add(exitLog(now, market, price, rsi, atr, volRatio, density, execStrength, profitRate));
+            if (regime == MarketRegime.BEAR) {
+                logExit(now, market, price, rsi, atr, volRatio, exec, profit, "EXIT_BEAR");
                 return -1;
             }
 
-            replayLogs.add(holdLog(now, market, price, rsi, atr, volRatio, density, execStrength));
+            if (exec < EXIT_EXEC_STRENGTH &&
+                    curVol < avgVol * EXIT_VOL_DROP &&
+                    profit < 0.01) {
+                logExit(now, market, price, rsi, atr, volRatio, exec, profit, "EXIT_EARLY");
+                return -1;
+            }
+
+            if (profit > 0 &&
+                    exec < prevExec * 0.85 &&
+                    exec < 0.5) {
+                logExit(now, market, price, rsi, atr, volRatio, exec, profit, "EXIT_DIVERGENCE");
+                return -1;
+            }
+
+            if (price < buy - atr * 2.0) {
+                logExit(now, market, price, rsi, atr, volRatio, exec, profit, "EXIT_STOP");
+                return -1;
+            }
+
             return 0;
         }
 
         /* ======================
-         * 🚫 필터
+         * BUY (장 상태별)
          * ====================== */
-        if (isBadMarket(candles, now)) return 0;
-        if (isFakePump(candles, now)) return 0;
-        if (execStrength < MIN_EXECUTION_STRENGTH) return 0;
+        if (regime == MarketRegime.BEAR) return 0;
 
-        /* ======================
-         * ✅ 매수
-         * ====================== */
-        if (rsi > 55 && volRatio >= 2.0) {
-            replayLogs.add(buyLog(now, market, price, rsi, atr, volRatio, density, execStrength));
+        if (regime == MarketRegime.SIDEWAYS) {
+            if (rsi < 60 || volRatio < 2.5 || exec < 0.6) return 0;
+        }
+
+        if (rsi > 55 && volRatio >= 2.0 && exec >= MIN_EXEC_STRENGTH) {
+            logBuy(now, market, price, rsi, atr, volRatio, exec, regime.name());
             return 1;
         }
 
@@ -259,71 +262,40 @@ public class VolumeConfirmedBreakoutStrategy implements TradingStrategy {
     }
 
     /* ==============================
-     * 🔁 Replay Helpers
+     * 로그
      * ============================== */
-    private ReplayLog buyLog(LocalDateTime t, String m, double p, double r, double a,
-                             double v, double d, double e) {
-        saveToDb(m, t, "BUY", p, r, a, v, d, e, null);
-        return ReplayLog.builder()
-                .time(t).market(m).action("BUY")
+    private void logBuy(LocalDateTime t, String m, double p, double r,
+                        double a, double v, double e, String reason) {
+
+        replayLogs.add(ReplayLog.builder()
+                .time(t).market(m).action("BUY").reason(reason)
                 .price(p).rsi(r).atr(a)
-                .volumeRatio(v).density(d)
-                .executionStrength(e)
-                .build();
-    }
+                .volumeRatio(v).executionStrength(e)
+                .build());
 
-    private ReplayLog holdLog(LocalDateTime t, String m, double p, double r, double a,
-                              double v, double d, double e) {
-        return ReplayLog.builder()
-                .time(t).market(m).action("HOLD")
-                .price(p).rsi(r).atr(a)
-                .volumeRatio(v).density(d)
-                .executionStrength(e)
-                .build();
-    }
-
-    private ReplayLog exitLog(LocalDateTime t, String m, double p, double r, double a,
-                              double v, double d, double e, double pr) {
-        saveToDb(m, t, "EXIT", p, r, a, v, d, e, pr);
-        return ReplayLog.builder()
-                .time(t).market(m).action("EXIT")
-                .price(p).rsi(r).atr(a)
-                .volumeRatio(v).density(d)
-                .executionStrength(e)
-                .profitRate(pr)
-                .build();
-    }
-
-    /** DB 저장 */
-    private void saveToDb(String market, LocalDateTime time, String action,
-                          double price, double rsi, double atr,
-                          double volumeRatio, double density,
-                          double execStrength, Double profitRate) {
-        if (!dbLoggingEnabled) return;
-
-        try {
+        if (dbLoggingEnabled) {
             replayLogService.saveBreakoutLog(
-                    market, time, action, price, rsi, atr,
-                    volumeRatio, density, profitRate, sessionId
+                    m, t, "BUY", p, r, a, v, 0, e, null, sessionId
             );
-        } catch (Exception e) {
-            log.debug("[REPLAY_DB] Save failed: {}", e.getMessage());
         }
     }
 
-    /** 현재 세션 ID 조회 */
-    public String getSessionId() {
-        return sessionId;
-    }
+    private void logExit(LocalDateTime t, String m, double p, double r,
+                         double a, double v, double e,
+                         double pr, String reason) {
 
-    /** 메모리 로그 가져오기 (API용) */
-    public List<ReplayLog> getReplayLogs() {
-        return new ArrayList<>(replayLogs);
-    }
+        replayLogs.add(ReplayLog.builder()
+                .time(t).market(m).action("EXIT").reason(reason)
+                .price(p).rsi(r).atr(a)
+                .volumeRatio(v).executionStrength(e)
+                .profitRate(pr)
+                .build());
 
-    /** 메모리 로그 클리어 */
-    public void clearReplayLogs() {
-        replayLogs.clear();
+        if (dbLoggingEnabled) {
+            replayLogService.saveBreakoutLog(
+                    m, t, "EXIT", p, r, a, v, 0, e, pr, sessionId
+            );
+        }
     }
 
     @Override

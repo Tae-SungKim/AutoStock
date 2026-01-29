@@ -66,8 +66,8 @@ public class StrategyReplayLogService {
     @Transactional
     public void saveBreakoutLog(String market, LocalDateTime time, String action,
                                  double price, double rsi, double atr,
-                                 double volumeRatio, double density, Double profitRate,
-                                 String sessionId) {
+                                 double volumeRatio, double density, double executionStrength,
+                                 Double profitRate, String sessionId) {
         StrategyReplayLog log = StrategyReplayLog.builder()
                 .strategyName("VolumeConfirmedBreakoutStrategy")
                 .market(market)
@@ -78,6 +78,7 @@ public class StrategyReplayLogService {
                 .atr(BigDecimal.valueOf(atr))
                 .volumeRatio(BigDecimal.valueOf(volumeRatio))
                 .density(BigDecimal.valueOf(density))
+                .executionStrength(BigDecimal.valueOf(executionStrength))
                 .profitRate(profitRate != null ? BigDecimal.valueOf(profitRate) : null)
                 .serverId(serverId)
                 .sessionId(sessionId)

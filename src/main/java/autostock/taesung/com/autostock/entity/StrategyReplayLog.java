@@ -72,6 +72,10 @@ public class StrategyReplayLog {
     @Column(precision = 10, scale = 4)
     private BigDecimal density;
 
+    /** 체결 강도 (호가창 기반) */
+    @Column(precision = 10, scale = 4)
+    private BigDecimal executionStrength;
+
     /** Z-score */
     @Column(precision = 10, scale = 4)
     private BigDecimal zScore;
