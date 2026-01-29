@@ -28,6 +28,32 @@ public class VolumeConfirmedBreakoutStrategy implements TradingStrategy {
 
     private final String sessionId = UUID.randomUUID().toString().substring(0, 8);
 
+    /** DB 저장 활성화 */
+    @Setter
+    private boolean dbLoggingEnabled = true;
+
+    /** 리플레이 로그 DTO */
+    @Getter
+    @Builder
+    public static class ReplayLog {
+        LocalDateTime time;
+        String market;
+        String action;
+        String reason;
+        double price;
+        double rsi;
+        double atr;
+        double volumeRatio;
+        double executionStrength;
+        Double profitRate;
+    }
+
+    private final List<ReplayLog> replayLogs = new ArrayList<>();
+
+    public String getSessionId() { return sessionId; }
+    public List<ReplayLog> getReplayLogs() { return new ArrayList<>(replayLogs); }
+    public void clearReplayLogs() { replayLogs.clear(); }
+
     /* ==============================
      * Market State
      * ============================== */
